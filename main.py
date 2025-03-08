@@ -24,6 +24,10 @@ def configure_logging(level_name):
     level = getattr(logging, level_name.upper(), logging.INFO)
     logging.getLogger().setLevel(level)
 
+# Load hardware acceleration settings from environment
+force_hardware_acceleration = os.getenv('FORCE_HARDWARE_ACCELERATION', 'true').lower() == 'true'
+allow_software_fallback = os.getenv('ALLOW_SOFTWARE_FALLBACK', 'false').lower() == 'true'
+
 # Check for Apple Silicon and initialize hardware acceleration
 is_apple_silicon = platform.system() == 'Darwin' and platform.machine().startswith('arm')
 hardware_acceleration_available = False
@@ -38,8 +42,14 @@ if is_apple_silicon:
         hardware_acceleration_available = True
         logging.info("Hardware acceleration enabled on Apple Silicon")
     except ImportError as e:
-        logging.warning(f"Hardware acceleration unavailable: {e}")
+        if force_hardware_acceleration and not allow_software_fallback:
+            logging.error(f"Hardware acceleration required but unavailable: {e}")
+            raise RuntimeError("Hardware acceleration required but unavailable. Set ALLOW_SOFTWARE_FALLBACK=true to allow software processing.")
+        logging.warning(f"Hardware acceleration unavailable, falling back to software processing: {e}")
 else:
+    if force_hardware_acceleration and not allow_software_fallback:
+        logging.error("Hardware acceleration required but not running on Apple Silicon")
+        raise RuntimeError("Hardware acceleration required but not running on Apple Silicon. Set ALLOW_SOFTWARE_FALLBACK=true to allow software processing.")
     logging.info("Not running on Apple Silicon, using software processing")
 
 # Global variables
@@ -138,7 +148,9 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                 scaled_h = cell_h
                 scaled_w = int(scaled_h * frame_aspect)
                 crop_x = (scaled_w - cell_w) // 2
-                if hardware_acceleration_available:
+                
+                # Check if we should use hardware or software processing
+                if is_apple_silicon and hardware_acceleration_available:
                     ci_img = cv_to_ci_image(previous_frame)
                     scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
                     scale_filter.setValue_forKey_(ci_img, "inputImage")
@@ -153,7 +165,12 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                     cell = ci_to_cv_image(cell_ci, cell_w, cell_h)
                     # Clean up Core Image objects
                     del ci_img, scaled_ci, cell_ci
+                elif force_hardware_acceleration and not allow_software_fallback:
+                    # If hardware acceleration is required but not available, log an error
+                    logging.error(f"Hardware acceleration required but not available or not on Apple Silicon")
+                    raise RuntimeError("Hardware acceleration required but not available. Set ALLOW_SOFTWARE_FALLBACK=true to use software processing.")
                 else:
+                    # Fall back to software processing
                     scaled = cv2.resize(previous_frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
                     cell = scaled[:, crop_x:crop_x + cell_w]
                     del scaled  # Clean up scaled frame
@@ -162,7 +179,9 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                 scaled_w = cell_w
                 scaled_h = int(scaled_w / frame_aspect)
                 crop_y = (scaled_h - cell_h) // 2
-                if hardware_acceleration_available:
+                
+                # Check if we should use hardware or software processing
+                if is_apple_silicon and hardware_acceleration_available:
                     ci_img = cv_to_ci_image(previous_frame)
                     scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
                     scale_filter.setValue_forKey_(ci_img, "inputImage")
@@ -177,7 +196,12 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                     cell = ci_to_cv_image(cell_ci, cell_w, cell_h)
                     # Clean up Core Image objects
                     del ci_img, scaled_ci, cell_ci
+                elif force_hardware_acceleration and not allow_software_fallback:
+                    # If hardware acceleration is required but not available, log an error
+                    logging.error(f"Hardware acceleration required but not available or not on Apple Silicon")
+                    raise RuntimeError("Hardware acceleration required but not available. Set ALLOW_SOFTWARE_FALLBACK=true to use software processing.")
                 else:
+                    # Fall back to software processing
                     scaled = cv2.resize(previous_frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
                     cell = scaled[crop_y:crop_y + cell_h, :]
                     del scaled  # Clean up scaled frame
@@ -233,17 +257,32 @@ def get_stream_url(url):
 # Main application loop
 def main():
     global running, grid_size, depth, debug_mode, frame_count, processed_count, displayed_count, dropped_count
+    global force_hardware_acceleration, allow_software_fallback
+    
     parser = argparse.ArgumentParser(description='Recursive Video Grid')
     parser.add_argument('--grid-size', type=int, default=3)
     parser.add_argument('--depth', type=int, default=1)
     parser.add_argument('--youtube-url', type=str, default=os.getenv('YOUTUBE_URL'))
     parser.add_argument('--log-level', type=str, default='INFO')
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--force-hardware', action='store_true', help='Force hardware acceleration')
+    parser.add_argument('--allow-software', action='store_true', help='Allow software fallback if hardware acceleration fails')
+    
     args = parser.parse_args()
     grid_size, depth = args.grid_size, args.depth
     configure_logging(args.log_level)
     debug_mode = args.debug
+    
+    # Override environment settings with command-line options if provided
+    if args.force_hardware:
+        force_hardware_acceleration = True
+        logging.info("Hardware acceleration forced by command-line option")
+    if args.allow_software:
+        allow_software_fallback = True
+        logging.info("Software fallback allowed by command-line option")
+    
     logging.info(f"Starting with debug={debug_mode} (toggle with 'd')")
+    logging.info(f"Hardware acceleration: forced={force_hardware_acceleration}, software fallback={allow_software_fallback}")
 
     pygame.init()
     screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
@@ -318,12 +357,18 @@ def main():
             # Overlay stats
             info_surface = pygame.Surface((screen.get_width(), 150), pygame.SRCALPHA)
             info_surface.fill((0, 0, 0, 128))
+            hw_status = "Enabled" if hardware_acceleration_available else "Disabled"
+            if is_apple_silicon and force_hardware_acceleration:
+                hw_status += " (Forced)"
+            if not hardware_acceleration_available and allow_software_fallback:
+                hw_status += " (Software Fallback)"
+                
             texts = [
                 f"Grid: {grid_size}x{grid_size}, Depth: {depth}",
                 f"Captured: {frame_count}, Displayed: {displayed_count}",
                 f"Processing: {last_process_time * 1000:.1f}ms",
                 f"FPS: {int(clock.get_fps())}",
-                f"Hardware: {'Enabled' if hardware_acceleration_available else 'Disabled'}",
+                f"Hardware: {hw_status}",
                 f"Mode: {'DEBUG' if debug_mode else 'GRID'} (press 'd' to toggle)"
             ]
             for i, text in enumerate(texts):
