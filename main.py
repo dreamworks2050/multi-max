@@ -63,9 +63,13 @@ def handle_keyboard_event(key_name):
     elif key_name == 'down' and grid_size > 1:
         grid_size -= 1
         logging.info(f"Grid size decreased to {grid_size}")
-    elif key_name in '1234567890':
-        depth = int(key_name) if key_name != '0' else 10
-        logging.info(f"Recursion depth set to {depth}")
+    elif key_name in '1234567890' and key_name:  # Check that key_name is not empty
+        try:
+            depth = int(key_name) if key_name != '0' else 10
+            logging.info(f"Recursion depth set to {depth}")
+        except ValueError:
+            # Just in case there's any issue with conversion
+            logging.warning(f"Invalid depth value: {key_name}")
     elif key_name == 'd':
         debug_mode = not debug_mode
         logging.info(f"Debug mode {'enabled' if debug_mode else 'disabled'}")
@@ -77,6 +81,56 @@ def signal_handler(sig, frame):
     running = False
 
 signal.signal(signal.SIGINT, signal_handler)
+
+# Utility function to downsample frame based on grid size
+def downsample_frame(frame, n, min_cell_size=80):
+    """Downsample frame based on grid size to speed up processing
+    
+    Args:
+        frame: The input frame
+        n: The grid size
+        min_cell_size: Minimum target cell size in pixels
+        
+    Returns:
+        Downsampled frame that will result in approximately min_cell_size cells
+    """
+    h, w = frame.shape[:2]
+    
+    # Calculate optimal output size based on grid size
+    target_cell_size = min_cell_size
+    
+    # If grid is large, reduce resolution proportionally
+    if n > 3:
+        # Calculate what the cell size would be at current resolution
+        current_cell_size = min(h, w) / n
+        
+        # If cell size is already smaller than minimum, resize to make cells ~min_cell_size
+        if current_cell_size < target_cell_size:
+            # Calculate scaling factor to achieve target cell size
+            scale_factor = target_cell_size * n / min(h, w)
+            
+            # Calculate new dimensions while maintaining aspect ratio
+            new_h = int(h * scale_factor)
+            new_w = int(w * scale_factor)
+            
+            # Don't upscale - only downsample
+            if scale_factor < 1.0:
+                # Resize using hardware acceleration if available
+                if hardware_acceleration_available:
+                    ci_img = cv_to_ci_image(frame)
+                    scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
+                    scale_filter.setValue_forKey_(ci_img, "inputImage")
+                    scale_filter.setValue_forKey_(scale_factor, "inputScale")
+                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+                    scaled_ci = scale_filter.valueForKey_("outputImage")
+                    frame = ci_to_cv_image(scaled_ci, new_w, new_h)
+                else:
+                    # Fallback to OpenCV for non-Apple Silicon
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                
+                logging.debug(f"Downsampled frame from {w}x{h} to {new_w}x{new_h} for grid {n}x{n}")
+    
+    return frame
 
 # Grid effect functions with Apple Silicon hardware acceleration
 def cv_to_ci_image(cv_img):
@@ -101,63 +155,104 @@ def ci_to_cv_image(ci_img, width, height):
 
 def hardware_grid_arrange(frame, n, current_d):
     """Apply grid arrangement using Apple Silicon hardware acceleration"""
-    if current_d == 0 or frame.shape[0] // n < 4 or frame.shape[1] // n < 4:
+    if current_d == 0 or n <= 1 or frame.shape[0] // n < 2 or frame.shape[1] // n < 2:
         return frame
+    
     try:
+        h, w = frame.shape[:2]
+        
+        # OPTIMIZATION: Downsample the frame first based on grid size
+        frame = downsample_frame(frame, n)
+        h, w = frame.shape[:2]  # Update dimensions after downsampling
+        
+        # Calculate cell dimensions to ensure full coverage
+        # We calculate sizes to fill the complete frame with no remainder
+        base_cell_h = h // n
+        base_cell_w = w // n
+        
+        # Calculate the remaining pixels to distribute
+        remainder_h = h % n
+        remainder_w = w % n
+        
+        # Create a blank result image
+        result = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # OPTIMIZATION: Create just one source cell and reuse it
         # Convert to CoreImage for hardware acceleration
         ci_frame = cv_to_ci_image(frame)
-        h, w = frame.shape[:2]
-        result = np.zeros((h, w, 3), dtype=np.uint8)
-        cell_h, cell_w = h // n, w // n
+        
+        # Pre-process a single representative cell
         target_ratio = 16 / 9
         frame_ratio = w / h
-
+        
+        # Generate single sample cell with hardware acceleration
+        scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
+        scale_filter.setValue_forKey_(ci_frame, "inputImage")
+        
+        # Use the base cell dimensions for the sample cell
+        if frame_ratio == target_ratio:
+            scale = base_cell_w / w
+            scale_filter.setValue_forKey_(scale, "inputScale")
+            scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+            cell_ci = scale_filter.valueForKey_("outputImage")
+        elif frame_ratio > target_ratio:
+            scale = base_cell_h / h
+            scaled_width = w * scale
+            scale_filter.setValue_forKey_(scale, "inputScale")
+            scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+            scaled_ci = scale_filter.valueForKey_("outputImage")
+            crop_x = (scaled_width - base_cell_w) / 2.0
+            # Use hardware-accelerated cropping
+            crop_filter = CIFilter.filterWithName_("CICrop")
+            crop_filter.setValue_forKey_(scaled_ci, "inputImage")
+            crop_filter.setValue_forKey_([crop_x, 0, base_cell_w, base_cell_h], "inputRectangle")
+            cell_ci = crop_filter.valueForKey_("outputImage")
+        else:
+            scale = base_cell_w / w
+            scaled_height = h * scale
+            scale_filter.setValue_forKey_(scale, "inputScale")
+            scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+            scaled_ci = scale_filter.valueForKey_("outputImage")
+            crop_y = (scaled_height - base_cell_h) / 2.0
+            # Use hardware-accelerated cropping
+            crop_filter = CIFilter.filterWithName_("CICrop")
+            crop_filter.setValue_forKey_(scaled_ci, "inputImage")
+            crop_filter.setValue_forKey_([0, crop_y, base_cell_w, base_cell_h], "inputRectangle")
+            cell_ci = crop_filter.valueForKey_("outputImage")
+        
+        # Convert back to CV image
+        sample_cell = ci_to_cv_image(cell_ci, base_cell_w, base_cell_h)
+        
+        # Apply recursive grid to sample cell if needed
+        if current_d > 1:
+            sample_cell = hardware_grid_arrange(sample_cell, n, current_d - 1)
+        
+        # Now place the optimized cell into all grid positions, adjusting sizes to fill frame completely
+        y_pos = 0
         for i in range(n):
+            # Calculate this row's height (distribute remainder)
+            cell_h = base_cell_h + (1 if i < remainder_h else 0)
+            
+            x_pos = 0
             for j in range(n):
-                y, x = i * cell_h, j * cell_w
-                # Use hardware-accelerated CIFilter for scaling
-                scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
-                scale_filter.setValue_forKey_(ci_frame, "inputImage")
-
-                if frame_ratio == target_ratio:
-                    scale = cell_w / w
-                    scale_filter.setValue_forKey_(scale, "inputScale")
-                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
-                    cell_ci = scale_filter.valueForKey_("outputImage")
-                elif frame_ratio > target_ratio:
-                    scale = cell_h / h
-                    scaled_width = w * scale
-                    scale_filter.setValue_forKey_(scale, "inputScale")
-                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
-                    scaled_ci = scale_filter.valueForKey_("outputImage")
-                    crop_x = (scaled_width - cell_w) / 2.0
-                    # Use hardware-accelerated cropping
-                    crop_filter = CIFilter.filterWithName_("CICrop")
-                    crop_filter.setValue_forKey_(scaled_ci, "inputImage")
-                    crop_filter.setValue_forKey_([crop_x, 0, cell_w, cell_h], "inputRectangle")
-                    cell_ci = crop_filter.valueForKey_("outputImage")
-                else:
-                    scale = cell_w / w
-                    scaled_height = h * scale
-                    scale_filter.setValue_forKey_(scale, "inputScale")
-                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
-                    scaled_ci = scale_filter.valueForKey_("outputImage")
-                    crop_y = (scaled_height - cell_h) / 2.0
-                    # Use hardware-accelerated cropping
-                    crop_filter = CIFilter.filterWithName_("CICrop")
-                    crop_filter.setValue_forKey_(scaled_ci, "inputImage")
-                    crop_filter.setValue_forKey_([0, crop_y, cell_w, cell_h], "inputRectangle")
-                    cell_ci = crop_filter.valueForKey_("outputImage")
-
-                # Convert back to CV image
-                cell = ci_to_cv_image(cell_ci, cell_w, cell_h)
+                # Calculate this column's width (distribute remainder)
+                cell_w = base_cell_w + (1 if j < remainder_w else 0)
                 
-                # Recursively apply grid effect if depth > 1
-                if current_d > 1:
-                    cell = hardware_grid_arrange(cell, n, current_d - 1)
-                    
-                # Place the cell in the result image
-                result[y:y+cell_h, x:x+cell_w] = cell
+                # If this cell has a different size than the sample, resize it
+                if cell_h != base_cell_h or cell_w != base_cell_w:
+                    cell = cv2.resize(sample_cell, (cell_w, cell_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    cell = sample_cell
+                
+                # Place the cell at the exact position
+                result[y_pos:y_pos+cell_h, x_pos:x_pos+cell_w] = cell
+                
+                # Move to next column position
+                x_pos += cell_w
+            
+            # Move to next row position
+            y_pos += cell_h
+        
         return result
     except Exception as e:
         logging.debug(f"Hardware grid failed: {e}, falling back to software implementation")
@@ -170,47 +265,84 @@ def sw_grid_arrange(frame, n, current_d):
         # For debugging - just pass through the frame without grid effect
         return frame.copy()
             
-    if current_d == 0:
+    if current_d == 0 or n <= 1:
         return frame
         
     h, w = frame.shape[:2]
-    cell_h, cell_w = h // n, w // n
-    if cell_h < 1 or cell_w < 1:
-        logging.warning(f"Cell size too small: {cell_h}x{cell_w}, filling with average color")
+    
+    # OPTIMIZATION: Downsample the frame first based on grid size
+    frame = downsample_frame(frame, n)
+    h, w = frame.shape[:2]  # Update dimensions after downsampling
+    
+    # Calculate cell dimensions to ensure full coverage
+    base_cell_h = h // n
+    base_cell_w = w // n
+    
+    # Calculate the remaining pixels to distribute
+    remainder_h = h % n
+    remainder_w = w % n
+    
+    if base_cell_h < 1 or base_cell_w < 1:
+        logging.warning(f"Cell size too small: {base_cell_h}x{base_cell_w}, filling with average color")
         return np.full((h, w, 3), cv2.mean(frame)[:3], dtype=np.uint8)
     
-    result = np.zeros((h, w, 3), dtype=np.uint8)
+    # OPTIMIZATION: Create just one source cell and reuse it
     target_ratio = 16 / 9
     frame_ratio = w / h
+    
+    # Generate single sample cell
+    if frame_ratio > target_ratio:
+        resize_h = max(base_cell_h, 1)
+        resize_w = max(int(resize_h * frame_ratio), 1)
+        resized = cv2.resize(frame, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
+        start_x = max(0, (resize_w - base_cell_w) // 2)
+        end_x = min(resize_w, start_x + base_cell_w)
+        sample_cell = resized[:, start_x:end_x]
+        if sample_cell.shape[1] != base_cell_w or sample_cell.shape[0] != base_cell_h:
+            sample_cell = cv2.resize(sample_cell, (base_cell_w, base_cell_h), interpolation=cv2.INTER_AREA)
+    else:
+        resize_w = max(base_cell_w, 1)
+        resize_h = max(int(resize_w / frame_ratio), 1)
+        resized = cv2.resize(frame, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
+        start_y = max(0, (resize_h - base_cell_h) // 2)
+        end_y = min(resize_h, start_y + base_cell_h)
+        sample_cell = resized[start_y:end_y, :]
+        if sample_cell.shape[0] != base_cell_h or sample_cell.shape[1] != base_cell_w:
+            sample_cell = cv2.resize(sample_cell, (base_cell_w, base_cell_h), interpolation=cv2.INTER_AREA)
+    
+    # Apply recursive grid to sample cell if needed
+    if current_d > 1:
+        sample_cell = sw_grid_arrange(sample_cell, n, current_d - 1)
+    
+    # Create result frame
+    result = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # Now place the optimized cell into all grid positions with exact sizing to fill frame completely
+    y_pos = 0
     for i in range(n):
+        # Calculate this row's height (distribute remainder)
+        cell_h = base_cell_h + (1 if i < remainder_h else 0)
+        
+        x_pos = 0
         for j in range(n):
-            y, x = i * cell_h, j * cell_w
-            if frame_ratio > target_ratio:
-                resize_h = max(cell_h, 1)
-                resize_w = max(int(resize_h * frame_ratio), 1)
-                cell = cv2.resize(frame, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
-                start_x = max(0, (resize_w - cell_w) // 2)
-                end_x = min(resize_w, start_x + cell_w)
-                cropped_cell = cell[:, start_x:end_x]
-                if cropped_cell.shape[1] != cell_w or cropped_cell.shape[0] != cell_h:
-                    cropped_cell = cv2.resize(cropped_cell, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
-                cell = cropped_cell
+            # Calculate this column's width (distribute remainder)
+            cell_w = base_cell_w + (1 if j < remainder_w else 0)
+            
+            # If this cell has a different size than the sample, resize it
+            if cell_h != base_cell_h or cell_w != base_cell_w:
+                cell = cv2.resize(sample_cell, (cell_w, cell_h), interpolation=cv2.INTER_LINEAR)
             else:
-                resize_w = max(cell_w, 1)
-                resize_h = max(int(resize_w / frame_ratio), 1)
-                cell = cv2.resize(frame, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
-                start_y = max(0, (resize_h - cell_h) // 2)
-                end_y = min(resize_h, start_y + cell_h)
-                cropped_cell = cell[start_y:end_y, :]
-                if cropped_cell.shape[0] != cell_h or cropped_cell.shape[1] != cell_w:
-                    cropped_cell = cv2.resize(cropped_cell, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
-                cell = cropped_cell
-                
-            # Recursively apply grid effect if depth > 1
-            if current_d > 1:
-                cell = sw_grid_arrange(cell, n, current_d - 1)
-                
-            result[y:y+cell_h, x:x+cell_w] = cell
+                cell = sample_cell
+            
+            # Place the cell at the exact position
+            result[y_pos:y_pos+cell_h, x_pos:x_pos+cell_w] = cell
+            
+            # Move to next column position
+            x_pos += cell_w
+        
+        # Move to next row position
+        y_pos += cell_h
+    
     return result
 
 # Choose the appropriate grid function based on hardware
@@ -233,9 +365,15 @@ def apply_grid_effect(frame, n, d):
     try:
         if d == 0:
             return frame.copy()
-            
-        # Apply actual grid effect
+        
+        # Use the appropriate grid function
+        start_time = time.time()
         result = grid_arrange(frame.copy(), n, d)
+        process_time = time.time() - start_time
+        
+        # Log performance stats for large grids
+        if n > 10 or d > 1:
+            logging.debug(f"Grid effect for {n}x{n} grid (depth {d}) took {process_time:.3f} seconds")
         
         # Clean up memory
         del frame
@@ -321,6 +459,7 @@ def main():
     last_gc_time = time.time()
     last_status_time = time.time()
     last_effect_change_time = time.time()
+    last_process_time = 0  # Track processing time
     
     # Main loop
     logging.info("Starting main loop")
@@ -330,6 +469,7 @@ def main():
     
     while running:
         current_time = time.time()
+        loop_start_time = current_time
         
         # Handle events
         for event in pygame.event.get():
@@ -344,7 +484,8 @@ def main():
                     handle_keyboard_event('down')
                 elif event.key == pygame.K_d:
                     handle_keyboard_event('d')
-                elif event.unicode in '0123456789':
+                # Check if unicode attribute exists and is not empty
+                elif hasattr(event, 'unicode') and event.unicode and event.unicode in '0123456789':
                     handle_keyboard_event(event.unicode)
         
         # Log when effect settings change
@@ -368,6 +509,7 @@ def main():
         frame_count += 1
         
         # Apply grid effect if not in debug mode
+        process_start_time = time.time()
         try:
             if not debug_mode:
                 # Apply hardware-accelerated grid effect
@@ -376,6 +518,10 @@ def main():
             else:
                 # Just pass through the frame in debug mode
                 processed_frame = frame.copy()
+            
+            # Track processing time
+            last_process_time = time.time() - process_start_time
+            
         except Exception as e:
             logging.error(f"Error applying effect: {e}")
             processed_frame = frame.copy()
@@ -398,7 +544,14 @@ def main():
             # Prepare stats text
             grid_text = f"Grid: {grid_size}x{grid_size}, Depth: {depth}"
             frames_text = f"Captured: {frame_count}, Displayed: {displayed_count}"
-            process_text = f"Processed: {processed_count}, Dropped: {dropped_count}"
+            
+            # Format processing time for display
+            if last_process_time > 0:
+                process_ms = last_process_time * 1000
+                process_text = f"Processing: {process_ms:.1f}ms per frame"
+            else:
+                process_text = "Processing: N/A"
+                
             fps_text = f"FPS: {int(clock.get_fps())}"
             hw_text = f"Hardware: {'Enabled' if hardware_acceleration_available else 'Disabled'}"
             debug_text = f"Mode: {'DEBUG/PASSTHROUGH' if debug_mode else 'NORMAL/GRID'} (press 'd' to toggle)"
@@ -421,6 +574,9 @@ def main():
             logging.error(f"Error displaying frame: {e}")
             dropped_count += 1
         
+        # Calculate frame processing time
+        frame_process_time = time.time() - loop_start_time
+        
         # Garbage collection periodically
         if current_time - last_gc_time > 10.0:
             gc.collect()
@@ -429,11 +585,19 @@ def main():
         # Log status periodically
         if current_time - last_status_time > 5.0:
             mode_text = "DEBUG/PASSTHROUGH" if debug_mode else "NORMAL/GRID"
-            logging.info(f"Status: {frame_count} captured, {displayed_count} displayed, FPS: {int(clock.get_fps())}, Mode: {mode_text}")
+            process_ms = last_process_time * 1000 if last_process_time > 0 else 0
+            logging.info(f"Status: {frame_count} captured, {displayed_count} displayed, " +
+                         f"FPS: {int(clock.get_fps())}, Process: {process_ms:.1f}ms, Mode: {mode_text}")
             last_status_time = current_time
             
+        # Dynamically adjust frame rate limit based on processing time
+        target_fps = 30
+        if frame_process_time > 0.033 and not debug_mode:  # If processing takes more than 33ms (30fps)
+            # Reduce target FPS proportionally to processing time
+            target_fps = max(5, min(30, int(1.0 / frame_process_time)))
+            
         # Limit frame rate
-        clock.tick(30)
+        clock.tick(target_fps)
     
     # Cleanup
     cap.release()
