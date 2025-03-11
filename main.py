@@ -16,6 +16,7 @@ import Quartz
 import tracemalloc
 import psutil
 from memory_profiler import profile
+from infinite_fractal import create_fractal_grid
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +49,22 @@ context_options = {}
 # Global variables for memory management
 cleanup_thread_running = False
 memory_cleanup_thread = None
+# Add cleanup stats tracking
+cleanup_stats = {
+    'total_cleanups': 0,
+    'extra_cleanups': 0,
+    'last_memory': 0,
+    'peak_memory': 0,
+    'last_growth_rate': 0,
+    'current_interval': 2.0
+}
+
+# Global variables to track key state and press duration
+key_pressed = {}
+key_press_start = {}
+key_repeat_delay = 0.2  # Initial delay before repeat starts (in seconds) - make this shorter
+key_repeat_interval = 0.03  # Interval between repeats once started (in seconds) - make this faster
+key_last_repeat = {}  # Track when the key was last repeated
 
 if is_apple_silicon:
     try:
@@ -128,12 +145,17 @@ else:
     logging.info("Not on Apple Silicon, using software processing")
 
 # Global variables
-grid_size = 3
+grid_size = 2
 depth = 1
 running = True
-debug_mode = True
+debug_mode = False
 show_info = True
 info_hidden_time = 0
+mode = "fractal"  # Default mode is fractal
+fractal_grid_size = 3  # Starting grid size for fractal mode (odd number for center position)
+fractal_debug = False  # Debug toggle for fractal mode
+fractal_source_position = 2  # Position of source in fractal mode (1=top-left, 2=center, 3=top-right)
+prev_output_frame = None
 
 # Stats
 frame_count = 0
@@ -155,35 +177,159 @@ def conditional_profile(func):
     return decorator(func)
 
 def handle_keyboard_event(key_name):
-    """Handle keyboard inputs for adjusting grid settings."""
-    global grid_size, depth, debug_mode, show_info, info_hidden_time
+    """Handle keyboard inputs for adjusting grid settings and mode switching."""
+    global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug, fractal_source_position, cap
     
     old_grid_size = grid_size
     old_depth = depth
     old_debug_mode = debug_mode
+    old_fractal_grid_size = fractal_grid_size
+    old_fractal_source_position = fractal_source_position
     
     try:
+        # Track if this is a held key (for logging purposes)
+        is_repeat = key_name in ['up', 'down'] and key_pressed.get(key_name, False) and time.time() - key_press_start.get(key_name, 0) > key_repeat_delay
+        
         if key_name == 'up':
-            grid_size += 1
-            logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
-        elif key_name == 'down' and grid_size > 1:
-            grid_size -= 1
-            logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+            if mode == "fractal":
+                # For position 2 (center), ensure we only use odd-numbered grid sizes
+                if fractal_source_position == 2:
+                    # Special case: going from 2x2 to 3x3
+                    if fractal_grid_size == 2:
+                        fractal_grid_size = 3
+                        logging.info(f"Grid size changed to 3x3 (with center source position)")
+                    # If current is even, move to next odd
+                    elif fractal_grid_size % 2 == 0:
+                        fractal_grid_size += 1
+                    else:
+                        fractal_grid_size += 2  # Jump to next odd number
+                else:
+                    fractal_grid_size += 1
+                
+                # Use default dimensions for calculations
+                frame_width, frame_height = 1280, 720
+                
+                visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
+                visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
+                
+                # Format resolution limiting text
+                resolution_text = ""
+                if is_resolution_limited:
+                    smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
+                    resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
+                
+                # Only log changes if not a key repeat, or if it's a significant change
+                if not is_repeat or fractal_grid_size % 5 == 0:
+                    logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
+                    logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
+            else:
+                grid_size += 1
+                if not is_repeat or grid_size % 5 == 0:
+                    logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+        elif key_name == 'down':
+            if mode == "fractal":
+                # For position 2 (center), ensure we only use odd-numbered grid sizes
+                # with special exception for 2x2 grid
+                if fractal_source_position == 2:
+                    # Special case: going from 3x3 to 2x2
+                    if fractal_grid_size == 3:
+                        fractal_grid_size = 2
+                        logging.info(f"Grid size changed to 2x2 (with top-right source position)")
+                    # Ensure we never go below 2 in position 2
+                    elif fractal_grid_size <= 2:
+                        fractal_grid_size = 2
+                    else:
+                        # If current is even, move to previous odd
+                        if fractal_grid_size % 2 == 0:
+                            fractal_grid_size -= 1
+                        else:
+                            fractal_grid_size -= 2  # Jump to previous odd number
+                else:
+                    fractal_grid_size = max(1, fractal_grid_size - 1)
+                
+                # Use default dimensions for calculations
+                frame_width, frame_height = 1280, 720
+                
+                visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
+                visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
+                
+                # Format resolution limiting text
+                resolution_text = ""
+                if is_resolution_limited:
+                    smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
+                    resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
+                
+                # Only log changes if not a key repeat, or if it's a significant change
+                if not is_repeat or fractal_grid_size % 5 == 0:
+                    logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
+                    logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
+            else:
+                grid_size = max(1, grid_size - 1)
+                if not is_repeat or grid_size % 5 == 0:
+                    logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
         elif key_name in '1234567890':
-            depth = int(key_name) if key_name != '0' else 10
-            logging.info(f"Recursion depth changed: {old_depth} → {depth}")
+            if mode == "grid":
+                # In grid mode, number keys change the recursion depth
+                old_depth = depth
+                depth = int(key_name) if key_name != '0' else 10
+                logging.info(f"Recursion depth changed: {old_depth} → {depth}")
+            else:
+                # In fractal mode, handle only keys 1-3 for source position
+                if key_name in '123':
+                    old_pos = fractal_source_position
+                    fractal_source_position = int(key_name)
+                    
+                    # When switching to position 2 (center), ensure we use an odd-sized grid (except for 2x2)
+                    if fractal_source_position == 2 and fractal_grid_size % 2 == 0 and fractal_grid_size != 2:
+                        # Adjust to next odd number
+                        fractal_grid_size += 1
+                        logging.info(f"Adjusted grid size to {fractal_grid_size} for center positioning")
+                    
+                    position_desc = {
+                        1: "top-left",
+                        2: "center",
+                        3: "top-right"
+                    }
+                    
+                    # Provide more specific message for the 2x2 special case
+                    if fractal_source_position == 2 and fractal_grid_size == 2:
+                        logging.info(f"Fractal source position changed: {position_desc[old_pos]} → top-right (special 2x2 case)")
+                    else:
+                        logging.info(f"Fractal source position changed: {position_desc[old_pos]} → {position_desc[fractal_source_position]}")
         elif key_name == 'd':
-            debug_mode = not debug_mode
-            mode_text = "enabled" if debug_mode else "disabled"
-            old_mode_text = "enabled" if old_debug_mode else "disabled"
-            logging.info(f"Debug mode changed: {old_mode_text} → {mode_text}")
+            if mode == "fractal":
+                fractal_debug = not fractal_debug
+                logging.info(f"Fractal debug mode: {'enabled' if fractal_debug else 'disabled'}")
+            else:
+                debug_mode = not debug_mode
+                logging.info(f"Debug mode: {'enabled' if debug_mode else 'disabled'}")
         elif key_name == 's':
             show_info = not show_info
             logging.info(f"Info overlay: {'shown' if show_info else 'hidden'}")
             if not show_info:
                 info_hidden_time = time.time()
+        elif key_name == 'f':
+            mode = "fractal" if mode != "fractal" else "grid"
+            logging.info(f"Mode changed to: {mode}")
+            
+            # If switching to fractal mode, log detailed fractal information
+            if mode == "fractal":
+                # Use default dimensions for calculations
+                frame_width, frame_height = 1280, 720
+                
+                visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
+                visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
+                
+                # Format resolution limiting text
+                resolution_text = ""
+                if is_resolution_limited:
+                    smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
+                    resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
+                
+                logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
+                logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
         
-        if old_grid_size != grid_size or old_depth != depth:
+        if mode == "grid" and (old_grid_size != grid_size or old_depth != depth):
             frame_h, frame_w = 720, 1280
             cell_h = frame_h // grid_size
             cell_w = frame_w // grid_size
@@ -471,22 +617,23 @@ def fill_black_pixels(result, grid_size):
 
 @conditional_profile
 def generate_grid_frame(previous_frame, grid_size, current_depth):
-    """Generate a grid frame recursively with direct assignment to reduce memory usage."""
-    global downsample_times, downsample_sizes
-    
-    ci_img = None
-    scale_filter = None
-    small_ci = None
-    small_frame = None
+    """Generate a grid frame for the specified depth level."""
+    global mode
     
     try:
         if previous_frame is None or previous_frame.size == 0:
-            logging.error(f"Depth {current_depth}: Previous frame is None or empty")
+            if mode == "grid":
+                logging.error(f"Depth {current_depth}: Previous frame is None or empty")
+            else:
+                logging.error("Previous frame is None or empty")
             return None
-        
+            
         h, w = previous_frame.shape[:2]
         if h <= 0 or w <= 0:
-            logging.error(f"Depth {current_depth}: Invalid frame dimensions: {w}x{h}")
+            if mode == "grid":
+                logging.error(f"Depth {current_depth}: Invalid frame dimensions: {w}x{h}")
+            else:
+                logging.error(f"Invalid frame dimensions: {w}x{h}")
             return None
         
         base_cell_h = h // grid_size
@@ -512,70 +659,66 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
 
         downsample_start_time = time.time()
         
-        if is_apple_silicon and hardware_acceleration_available:
+        if is_apple_silicon and hardware_acceleration_available and current_depth > 1:
             try:
-                import objc
-                with objc.autorelease_pool():
-                    ci_img = cv_to_ci_image(previous_frame)
-                    if ci_img is None:
+                # Convert OpenCV image to Core Image
+                h, w = previous_frame.shape[:2]
+                ci_image = cv_to_ci_image(previous_frame)
+                if ci_image is None:
+                    if mode == "grid":
                         logging.error(f"Depth {current_depth}: Failed to convert frame to CIImage")
-                        return None
-                    
-                    scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
-                    if scale_filter is None:
+                    else:
+                        logging.error("Failed to convert frame to CIImage")
+                    raise ValueError("Failed to convert frame to CIImage")
+                
+                # Create scale filter
+                scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
+                if scale_filter is None:
+                    if mode == "grid":
                         logging.error(f"Depth {current_depth}: Failed to create CILanczosScaleTransform filter")
-                        del ci_img
-                        ci_img = None
-                        return None
-                    
-                    scale_filter.setValue_forKey_(ci_img, "inputImage")
-                    scale_factor = min(small_h / h, small_w / w)
-                    scale_filter.setValue_forKey_(scale_factor, "inputScale")
-                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
-                    
-                    small_ci = scale_filter.valueForKey_("outputImage")
-                    
-                    del ci_img
-                    ci_img = None
-                    del scale_filter
-                    scale_filter = None
-                    
-                    gc.collect()
-                    
-                    if small_ci is None:
+                    else:
+                        logging.error("Failed to create CILanczosScaleTransform filter")
+                    raise ValueError("Failed to create scale filter")
+                
+                # Configure and apply filter
+                scale_filter.setValue_forKey_(ci_image, "inputImage")
+                scale = 1.0 / grid_size
+                scale_filter.setValue_forKey_(scale, "inputScale")
+                scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+                
+                # Get the output of the filter
+                output_image = scale_filter.valueForKey_("outputImage")
+                if output_image is None:
+                    if mode == "grid":
                         logging.error(f"Depth {current_depth}: Failed to apply scale filter")
-                        return None
-                    
-                    exact_w = int(w * scale_factor)
-                    exact_h = int(h * scale_factor)
-                    exact_w = (exact_w + 3) & ~3
-                    exact_h = (exact_h + 3) & ~3
-                    small_w = exact_w
-                    small_h = exact_h
-                    logging.debug(f"Depth {current_depth}: Hardware downsampled frame to {small_w}x{small_h}")
-                    
-                    small_frame = ci_to_cv_image(small_ci, exact_w, exact_h)
-                    
-                    del small_ci
-                    small_ci = None
-                    
-                    ci_context.clearCaches()
-                    logging.debug("Cleared Core Image cache after downsampling")
+                    else:
+                        logging.error("Failed to apply scale filter")
+                    raise ValueError("Failed to apply scale filter")
                 
-                if small_frame is None:
-                    logging.error(f"Depth {current_depth}: Failed to convert CIImage back to CV image")
-                    return None
-                
-                gc.collect()
+                # Convert back to OpenCV format
+                small_frame = ci_to_cv_image(output_image, small_w, small_h)
+                if small_frame is not None:
+                    small_h, small_w = small_frame.shape[:2]
+                    if mode == "grid":
+                        logging.debug(f"Depth {current_depth}: Hardware downsampled frame to {small_w}x{small_h}")
+                    else:
+                        logging.debug(f"Hardware downsampled frame to {small_w}x{small_h}")
+                    return hardware_process_grid_cells(small_frame, previous_frame, grid_size)
+                else:
+                    if mode == "grid":
+                        logging.error(f"Depth {current_depth}: Failed to convert CIImage back to CV image")
+                    else:
+                        logging.error("Failed to convert CIImage back to CV image")
+                    raise ValueError("Failed to convert CIImage back to CV image")
             except Exception as e:
-                logging.error(f"Depth {current_depth}: Error in hardware downsampling: {e}\n{traceback.format_exc()}")
+                if mode == "grid":
+                    logging.error(f"Depth {current_depth}: Error in hardware downsampling: {e}\n{traceback.format_exc()}")
+                else:
+                    logging.error(f"Error in hardware downsampling: {e}\n{traceback.format_exc()}")
                 
-                if ci_img is not None:
-                    del ci_img
-                    ci_img = None
-                if small_ci is not None:
-                    del small_ci
-                    small_ci = None
+                if ci_image is not None:
+                    del ci_image
+                    ci_image = None
                 if scale_filter is not None:
                     del scale_filter
                     scale_filter = None
@@ -601,15 +744,24 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
             logging.debug(f"Depth {current_depth}: Software downsampled frame to {small_w}x{small_h}")
         
         if small_frame is None or small_frame.size == 0:
-            logging.error(f"Depth {current_depth}: Failed to create valid downsampled frame")
+            if mode == "grid":
+                logging.error(f"Depth {current_depth}: Failed to create valid downsampled frame")
+            else:
+                logging.error("Failed to create valid downsampled frame")
             return None
 
         small_h, small_w = small_frame.shape[:2]
         if small_h <= 0 or small_w <= 0:
-            logging.error(f"Depth {current_depth}: Invalid downsampled frame dimensions: {small_w}x{small_h}")
+            if mode == "grid":
+                logging.error(f"Depth {current_depth}: Invalid downsampled frame dimensions: {small_w}x{small_h}")
+            else:
+                logging.error(f"Invalid downsampled frame dimensions: {small_w}x{small_h}")
             return None
-
-        logging.debug(f"Depth {current_depth}: Using downsampled frame of size {small_w}x{small_h}")
+        
+        if mode == "grid":
+            logging.debug(f"Depth {current_depth}: Using downsampled frame of size {small_w}x{small_h}")
+        else:
+            logging.debug(f"Using downsampled frame of size {small_w}x{small_h}")
 
         downsample_time = time.time() - downsample_start_time
         downsample_times.append(downsample_time)
@@ -638,8 +790,11 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                 cell_w = x_end - x_start
                 
                 if cell_h < 1 or cell_w < 1:
-                    logging.warning(f"Depth {current_depth}: Cell too small: {cell_w}x{cell_h}, using average color")
-                    avg_color = cv2.mean(small_frame)[:3]
+                    if mode == "grid":
+                        logging.warning(f"Depth {current_depth}: Cell too small: {cell_w}x{cell_h}, using average color")
+                    else:
+                        logging.warning(f"Cell too small: {actual_cell_w}x{actual_cell_h}, using average color")
+                    avg_color = np.mean(small_frame, axis=(0, 1)).astype(np.uint8)
                     result[y_start:y_end, x_start:x_end] = avg_color
                     continue
                     
@@ -661,7 +816,10 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                     result[y_start:y_end, x_start:x_end] = cv2.resize(cropped, (cell_w, cell_h), interpolation=interpolation)
                     
                 except Exception as e:
-                    logging.error(f"Error processing cell {i}x{j} at depth {current_depth}: {e}")
+                    if mode == "grid":
+                        logging.error(f"Error processing cell {i}x{j} at depth {current_depth}: {e}")
+                    else:
+                        logging.error(f"Error processing cell {i}x{j}: {e}")
                     result[y_start:y_end, x_start:x_end] = 0
                 
                 gc_frequency = max(10, total_cells // 10)
@@ -680,16 +838,23 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
         
         fill_black_pixels(result, grid_size)
 
-        logging.debug(f"Depth {current_depth}: Generated grid frame {w}x{h} with grid {grid_size}x{grid_size}")
+        if mode == "grid":
+            logging.debug(f"Depth {current_depth}: Generated grid frame {w}x{h} with grid {grid_size}x{grid_size}")
+        else:
+            logging.debug(f"Generated grid frame {w}x{h} with grid {grid_size}x{grid_size}")
         
         return result
     except Exception as e:
-        logging.error(f"Error in generate_grid_frame at depth {current_depth}: {e}\n{traceback.format_exc()}")
+        if mode == "grid":
+            logging.error(f"Error in generate_grid_frame at depth {current_depth}: {e}\n{traceback.format_exc()}")
+        else:
+            logging.error(f"Error in generate_grid_frame: {e}\n{traceback.format_exc()}")
         return None
 
 @conditional_profile
 def apply_grid_effect(frame, grid_size, depth):
     """Apply recursive grid effect to the frame."""
+    global mode
     previous_frame = None
     result = None
     
@@ -698,7 +863,10 @@ def apply_grid_effect(frame, grid_size, depth):
             logging.warning("apply_grid_effect received None or empty frame")
             return None
         if debug_mode or depth == 0:
-            logging.debug("Depth 0: Returning original frame (debug mode or depth=0)")
+            if mode == "grid":
+                logging.debug("Depth 0: Returning original frame (debug mode or depth=0)")
+            else:
+                logging.debug("Returning original frame (debug mode)")
             return frame.copy()
             
         previous_frame = frame.copy()
@@ -712,10 +880,16 @@ def apply_grid_effect(frame, grid_size, depth):
                     new_frame = generate_grid_frame(previous_frame, grid_size, d)
                     
                     if new_frame is None:
-                        logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
+                        if mode == "grid":
+                            logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
+                        else:
+                            logging.error("Failed to generate grid frame (returned None)")
                         failed_depths += 1
                         if failed_depths > max_failed_depths:
-                            logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
+                            if mode == "grid":
+                                logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
+                            else:
+                                logging.error(f"Too many failures ({failed_depths}), aborting effect")
                             result = previous_frame.copy()
                             del previous_frame
                             previous_frame = None
@@ -735,19 +909,31 @@ def apply_grid_effect(frame, grid_size, depth):
                     if is_apple_silicon and hardware_acceleration_available:
                         try:
                             ci_context.clearCaches()
-                            logging.debug(f"Depth {d}: Cleared Core Image cache after processing")
+                            if mode == "grid":
+                                logging.debug(f"Depth {d}: Cleared Core Image cache after processing")
+                            else:
+                                logging.debug("Cleared Core Image cache after processing")
                         except Exception as e:
-                            logging.error(f"Depth {d}: Failed to clear Core Image cache: {e}")
+                            if mode == "grid":
+                                logging.error(f"Depth {d}: Failed to clear Core Image cache: {e}")
+                            else:
+                                logging.error(f"Failed to clear Core Image cache: {e}")
                 
                 gc.collect()
             else:
                 new_frame = generate_grid_frame(previous_frame, grid_size, d)
                 
                 if new_frame is None:
-                    logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
+                    if mode == "grid":
+                        logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
+                    else:
+                        logging.error("Failed to generate grid frame (returned None)")
                     failed_depths += 1
                     if failed_depths > max_failed_depths:
-                        logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
+                        if mode == "grid":
+                            logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
+                        else:
+                            logging.error(f"Too many failures ({failed_depths}), aborting effect")
                         result = previous_frame.copy()
                         del previous_frame
                         previous_frame = None
@@ -863,11 +1049,14 @@ def start_memory_cleanup_thread():
         return
     
     def memory_cleanup_worker():
-        global cleanup_thread_running
+        global cleanup_thread_running, cleanup_stats, ci_context, hardware_acceleration_available, is_apple_silicon
         cleanup_thread_running = True
         cleanup_interval = 2.0
         memory_history = []
         history_size = 5
+        
+        # Use global cleanup stats instead of local
+        cleanup_stats['current_interval'] = cleanup_interval
         
         try:
             current_process = psutil.Process(os.getpid())
@@ -876,7 +1065,7 @@ def start_memory_cleanup_thread():
             current_process = None
         
         try:
-            logging.info("Starting periodic memory cleanup thread")
+            logging.debug("Starting periodic memory cleanup thread")
             while cleanup_thread_running:
                 time.sleep(cleanup_interval)
                 
@@ -885,7 +1074,9 @@ def start_memory_cleanup_thread():
                         try:
                             with objc.autorelease_pool():
                                 ci_context.clearCaches()
+                            # Only log debug level (not visible by default)
                             logging.debug("Periodic Core Image cache cleanup")
+                            cleanup_stats['total_cleanups'] += 1
                         except Exception as e:
                             logging.error(f"Error clearing CI cache in cleanup thread: {e}")
                     
@@ -901,17 +1092,24 @@ def start_memory_cleanup_thread():
                             memory_usage = current_process.memory_info().rss / 1024 / 1024
                             memory_history.append(memory_usage)
                             
+                            # Update stats
+                            cleanup_stats['last_memory'] = memory_usage
+                            cleanup_stats['peak_memory'] = max(cleanup_stats['peak_memory'], memory_usage)
+                            
                             if len(memory_history) > history_size:
                                 memory_history.pop(0)
                             
                             growth_rate = 0
                             if len(memory_history) >= 2:
                                 growth_rate = memory_history[-1] - memory_history[0]
+                                cleanup_stats['last_growth_rate'] = growth_rate
                                 
                             if memory_usage > 1500 or growth_rate > 100:
                                 cleanup_interval = 1.0
                                 if growth_rate > 200:
-                                    logging.warning(f"Memory growing rapidly ({growth_rate:.2f} MB), performing extra cleanup")
+                                    # Only log warning for severe cases
+                                    logging.debug(f"Memory growing rapidly ({growth_rate:.2f} MB), performing extra cleanup")
+                                    cleanup_stats['extra_cleanups'] += 1
                                     if ci_context is not None:
                                         try:
                                             ci_context.clearCaches()
@@ -919,15 +1117,34 @@ def start_memory_cleanup_thread():
                                             pass
                                     try:
                                         import sys
-                                        sys.modules.get('gc', {}).get('garbage', []).clear()
-                                    except Exception:
-                                        pass
-                                    for _ in range(3):
-                                        gc.collect()
+                                        if hasattr(sys.intern, 'clear'):
+                                            sys.intern.clear()
+                                    except Exception as e:
+                                        logging.debug(f"Could not clear interned strings: {e}")
+                                    gc.collect()
+                                    logging.debug("Recreated CIContext to free memory")
+                                    memory_to_free = memory_usage - 1500
+                                    if memory_to_free > 0:
+                                        logging.debug(f"Attempting to free {memory_to_free:.2f} MB of memory")
+                                        with objc.autorelease_pool():
+                                            ci_context.clearCaches()
+                                            minimal_options = {
+                                                kCIContextUseSoftwareRenderer: False,
+                                                "kCIContextCacheIntermediates": False,
+                                                "kCIContextPriorityRequestLow": True
+                                            }
+                                            old_context = ci_context
+                                            ci_context = CIContext.contextWithOptions_(minimal_options)
+                                            del old_context
+                                            old_context = None
+                                        for _ in range(3):
+                                            gc.collect()
                             elif memory_usage > 1000:
                                 cleanup_interval = 1.5
                             else:
                                 cleanup_interval = 2.0
+                                
+                            cleanup_stats['current_interval'] = cleanup_interval
                     except Exception as e:
                         logging.error(f"Error checking memory usage in cleanup thread: {e}")
                         cleanup_interval = 2.0
@@ -937,7 +1154,7 @@ def start_memory_cleanup_thread():
                     time.sleep(1.0)
         finally:
             cleanup_thread_running = False
-            logging.info("Memory cleanup thread stopped")
+            logging.debug("Memory cleanup thread stopped")
     
     memory_cleanup_thread = threading.Thread(target=memory_cleanup_worker, 
                                             name="MemoryCleanup", 
@@ -957,7 +1174,7 @@ def stop_memory_cleanup_thread():
                 memory_cleanup_thread.join(timeout=1.0)
                 
             memory_cleanup_thread = None
-            logging.info("Memory cleanup thread stopped")
+            logging.debug("Memory cleanup thread stopped")
         else:
             logging.debug("Memory cleanup thread not running or already stopped")
     except Exception as e:
@@ -965,10 +1182,97 @@ def stop_memory_cleanup_thread():
         cleanup_thread_running = False
         memory_cleanup_thread = None
 
+def calculate_visible_screens(fractal_grid_size, frame_width, frame_height):
+    """Calculate the number of visible screens in fractal mode, categorized by size."""
+    if fractal_grid_size < 2:
+        return 1, False, 0, {"larger_than_1px": 1, "exactly_1px": 0, "smaller_than_1px": False}
+    
+    min_dim = min(frame_width, frame_height)
+    max_level = int(np.floor(np.log(min_dim) / np.log(fractal_grid_size)))
+    r = fractal_grid_size ** 2 - 1
+    
+    # Count screens by category
+    screens_by_category = {
+        "larger_than_1px": 0,
+        "exactly_1px": 0,
+        "smaller_than_1px": False
+    }
+    
+    # Count total visible screens as before
+    visible_screens = 0
+    
+    # Find level where cells are approximately 1px in size
+    # We need to find the exact level where screens would be 1px
+    # This requires solving: min_dim / (fractal_grid_size ** k) ≈ 1.0
+    # k ≈ log(min_dim) / log(fractal_grid_size)
+    one_pixel_level = np.log(min_dim) / np.log(fractal_grid_size)
+    one_pixel_level_floor = int(np.floor(one_pixel_level))
+    one_pixel_level_ceil = int(np.ceil(one_pixel_level))
+    
+    # Calculate how close the floor level is to exactly 1px
+    floor_cell_size = min_dim / (fractal_grid_size ** one_pixel_level_floor)
+    ceil_cell_size = min_dim / (fractal_grid_size ** one_pixel_level_ceil)
+    
+    # Determine which level has screens closest to 1px
+    exact_pixel_level = one_pixel_level_floor if abs(floor_cell_size - 1.0) < abs(ceil_cell_size - 1.0) else one_pixel_level_ceil
+    
+    for k in range(max_level + 2):  # +2 to check one level beyond visible
+        # Calculate size of cells at this level
+        cell_size = min_dim / (fractal_grid_size ** k)
+        screens_at_level = r ** k
+        
+        if k <= max_level:
+            visible_screens += screens_at_level
+        
+        # Categorize by size
+        if k == exact_pixel_level:
+            # These are the screens that are closest to exactly 1px
+            screens_by_category["exactly_1px"] += screens_at_level
+        elif cell_size > 1.0:
+            screens_by_category["larger_than_1px"] += screens_at_level
+        else:
+            # If we have cells smaller than 1px, set the flag
+            screens_by_category["smaller_than_1px"] = True
+    
+    # Calculate the smallest cell size
+    smallest_cell_size = min_dim / (fractal_grid_size ** max_level)
+    is_resolution_limited = smallest_cell_size < 1.0
+    
+    # Debug output to verify calculations
+    logging.debug(f"Min dimension: {min_dim}, Max level: {max_level}")
+    logging.debug(f"One pixel level: {one_pixel_level}, Floor: {one_pixel_level_floor}, Ceil: {one_pixel_level_ceil}")
+    logging.debug(f"Floor cell size: {floor_cell_size}, Ceil cell size: {ceil_cell_size}")
+    logging.debug(f"Exact pixel level chosen: {exact_pixel_level}")
+    
+    return visible_screens, is_resolution_limited, max_level, screens_by_category
+
+def calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height):
+    """Calculate the number of visible recursive cells in fractal mode."""
+    if fractal_grid_size < 2:
+        return 0
+    
+    min_dim = min(frame_width, frame_height)
+    max_level = int(np.floor(np.log(min_dim) / np.log(fractal_grid_size)))
+    r = fractal_grid_size ** 2 - 1
+    visible_recursive_cells = 0
+    
+    for k in range(1, max_level + 1):
+        visible_recursive_cells += r ** k
+    
+    return visible_recursive_cells
+
 def main():
     """Main function with fixed-size frame surface and scaling for display."""
     global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
-    global force_hardware_acceleration, allow_software_fallback, enable_memory_tracing, ci_context, context_options
+    global hardware_acceleration_available, force_hardware_acceleration, allow_software_fallback, is_apple_silicon
+    global cap, mode, fractal_grid_size, fractal_debug, fractal_source_position, prev_output_frame, ci_context
+    global enable_memory_tracing
+    global key_pressed, key_press_start, key_last_repeat
+    
+    # Reset key tracking dictionaries
+    key_pressed = {}
+    key_press_start = {}
+    key_last_repeat = {}
     
     screen = None
     cap = None
@@ -986,6 +1290,10 @@ def main():
         screen_height = min(720, display_info.current_h - 100)
         screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
         
+        # Set initial background to white
+        screen.fill((255, 255, 255))
+        pygame.display.flip()
+        
         if is_apple_silicon and hardware_acceleration_available:
             start_memory_cleanup_thread()
         
@@ -1000,7 +1308,8 @@ def main():
             return
             
         parser = argparse.ArgumentParser(description='Recursive Video Grid')
-        parser.add_argument('--grid-size', type=int, default=3)
+        parser.add_argument('--grid-size', type=int, default=3,
+                            help='Grid size (odd numbers needed for center position in fractal mode)')
         parser.add_argument('--depth', type=int, default=1)
         parser.add_argument('--youtube-url', type=str, default=youtube_url)
         parser.add_argument('--log-level', type=str, default='INFO')
@@ -1009,9 +1318,21 @@ def main():
         parser.add_argument('--allow-software', action='store_true')
         parser.add_argument('--enable-memory-tracing', action='store_true')
         parser.add_argument('--test-hardware-accel', action='store_true')
+        parser.add_argument('--mode', type=str, choices=['grid', 'fractal'], default='fractal')
+        parser.add_argument('--fractal-source', type=int, choices=[1, 2, 3], default=2,
+                            help='Position of source in fractal mode (1=top-left, 2=center with odd grids and 2x2 special case, 3=top-right)')
         
         args = parser.parse_args()
         grid_size, depth = args.grid_size, args.depth
+        mode = args.mode
+        fractal_source_position = args.fractal_source
+        fractal_grid_size = args.grid_size
+        
+        # If in fractal mode with position 2, ensure the grid size is odd (except for the special 2x2 case)
+        if mode == "fractal" and fractal_source_position == 2 and fractal_grid_size % 2 == 0 and fractal_grid_size != 2:
+            fractal_grid_size += 1
+            logging.info(f"Adjusted grid size to {fractal_grid_size} for center positioning")
+        
         configure_logging(args.log_level)
         debug_mode = args.debug
         show_info = True
@@ -1075,6 +1396,10 @@ def main():
         pygame.display.set_caption("Recursive Grid Livestream")
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("Arial", 24)
+        
+        # Set initial background to white
+        screen.fill((255, 255, 255))
+        pygame.display.flip()
 
         stream_url = get_stream_url(args.youtube_url)
         if not stream_url:
@@ -1115,8 +1440,8 @@ def main():
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         frame_surface = pygame.Surface((frame_width, frame_height))
 
-        screen.fill((0, 0, 0))
-        loading_text = font.render("Loading video stream...", True, (255, 255, 255))
+        screen.fill((255, 255, 255))
+        loading_text = font.render("Loading video stream...", True, (0, 0, 0))
         screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2,
                                    screen.get_height() // 2 - loading_text.get_height() // 2))
         pygame.display.flip()
@@ -1139,8 +1464,31 @@ def main():
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     key = pygame.key.name(event.key)
-                    if key in ['up', 'down', 'd', 's'] or key in '0123456789':
+                    # Handle key immediately regardless of type
+                    if key in ['up', 'down', 'd', 's', 'f'] or key in '0123456789':
                         handle_keyboard_event(key)
+                    
+                    # Set up repeat tracking for arrow keys
+                    if key in ['up', 'down']:
+                        key_pressed[key] = True
+                        key_press_start[key] = current_time
+                        key_last_repeat[key] = current_time  # Initialize repeat timer on first press
+                elif event.type == pygame.KEYUP:
+                    key = pygame.key.name(event.key)
+                    if key in ['up', 'down']:
+                        key_pressed[key] = False
+                        key_last_repeat.pop(key, None)  # Clean up repeat timer
+
+            # Handle continuous key presses for arrow keys
+            for key in ['up', 'down']:
+                if key_pressed.get(key, False):
+                    press_duration = current_time - key_press_start.get(key, current_time)
+                    last_repeat_time = key_last_repeat.get(key, 0)
+                    
+                    # First repeat after initial delay, then continuous repeats at set interval
+                    if press_duration >= key_repeat_delay and (current_time - last_repeat_time) >= key_repeat_interval:
+                        handle_keyboard_event(key)
+                        key_last_repeat[key] = current_time
 
             ret, frame = cap.read()
             if not ret or frame is None:
@@ -1150,7 +1498,18 @@ def main():
             frame_count += 1
 
             process_start_time = time.time()
-            processed_frame = apply_grid_effect(frame, grid_size, depth)
+            if mode == "grid":
+                if debug_mode:
+                    processed_frame = frame.copy()
+                else:
+                    processed_frame = apply_grid_effect(frame, grid_size, depth)
+            elif mode == "fractal":
+                if fractal_debug:
+                    processed_frame = frame.copy()
+                else:
+                    processed_frame = create_fractal_grid(frame, prev_output_frame, fractal_grid_size, fractal_source_position)
+                    prev_output_frame = processed_frame.copy()
+            
             if processed_frame is None:
                 logging.warning("Processed frame is None, using original frame")
                 processed_frame = frame.copy()
@@ -1188,29 +1547,61 @@ def main():
                     if not hardware_acceleration_available and allow_software_fallback:
                         hw_status += " (Software Fallback)"
                     texts = [
-                        f"Grid: {grid_size}x{grid_size}, Depth: {depth}",
+                        f"Mode: {mode.upper()}",
+                        f"Grid: {grid_size if mode == 'grid' else fractal_grid_size}x{grid_size if mode == 'grid' else fractal_grid_size}",
+                        f"Depth: {depth if mode == 'grid' else 'N/A'}",
+                    ]
+                    
+                    # Add source position information for fractal mode
+                    if mode == "fractal":
+                        position_desc = {
+                            1: "top-left",
+                            2: "center",
+                            3: "top-right"
+                        }
+                        # Special case for 2x2 grid in position 2
+                        if fractal_source_position == 2 and fractal_grid_size == 2:
+                            texts.append(f"Source: top-right (special 2x2 case)")
+                        else:
+                            texts.append(f"Source: {position_desc[fractal_source_position]}")
+                    
+                    texts.extend([
+                        f"Debug: {'On' if (debug_mode if mode == 'grid' else fractal_debug) else 'Off'}",
                         f"Captured: {frame_count}, Displayed: {displayed_count}",
                         f"Processing: {last_process_time * 1000:.1f}ms",
                         f"FPS: {int(clock.get_fps())}",
                         f"Hardware: {hw_status}",
-                    ]
+                    ])
                     if downsample_times:
                         avg_time = sum(downsample_times) / len(downsample_times) * 1000
                         if len(downsample_sizes) > 0:
                             last_original, last_small = downsample_sizes[-1]
                             reduction_ratio = last_original / max(1, last_small)
                             texts.append(f"Downsampling: {avg_time:.1f}ms, Reduction: {reduction_ratio:.1f}x")
-                    if not debug_mode and depth > 0:
+                    if not debug_mode and depth > 0 and mode == "grid":
                         texts.append("")
                         texts.append("Grid Layer Breakdown:")
                         layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
                         for layer in layer_info:
                             texts.append(f"  {layer}")
                         texts.append(f"  Total screens = {formatted_total}")
+                    if mode == "fractal":
+                        visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
+                        visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
+                        texts.append("")
+                        texts.append("Fractal Screens:")
+                        
+                        # Format: "Infinite screens: [calculate the number of cells] 𝕏XX clusters of screens, each to infinity = XXXXX infinities of screens"
+                        texts.append(f"  Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
                     texts.append(f"Mode: {'DEBUG' if debug_mode else 'GRID'} (press 'd' to toggle)")
                     texts.append("")
                     texts.append("")
-                    texts.append("Press s to show/hide this info, d to debug, up/down grid size, 1 - 0 multiply depth")
+                    # Modify help text based on mode
+                    if mode == "grid":
+                        texts.append("Press s to show/hide this info, d to debug, up/down grid size, 1 - 0 multiply depth")
+                    else:
+                        texts.append("Press s to show/hide this info, d to debug, up/down grid size, f to switch modes")
+                        texts.append("Press 1-3 to change source position: 1=top-left, 2=center (odd grids + 2x2 special case), 3=top-right")
                     line_height = 25
                     padding = 20
                     required_height = len(texts) * line_height + padding * 2
@@ -1257,7 +1648,7 @@ def main():
                             logging.warning(f"Failed to release autorelease pool: {e}")
                     
                     if memory_usage > 1200:
-                        logging.info(f"Medium memory usage detected: {memory_usage:.2f} MB - performing cleanup")
+                        logging.debug(f"Medium memory usage detected: {memory_usage:.2f} MB - performing cleanup")
                         gc.collect()
                         ci_context.clearCaches()
                         
@@ -1267,7 +1658,7 @@ def main():
                                     del locals()[var_name]
                     
                     if memory_usage > 1800:
-                        logging.warning(f"High memory usage detected: {memory_usage:.2f} MB - performing context recreation")
+                        logging.debug(f"High memory usage detected: {memory_usage:.2f} MB - performing context recreation")
                         if is_apple_silicon:
                             try:
                                 with objc.autorelease_pool():
@@ -1282,17 +1673,10 @@ def main():
                                         del old_context
                                         old_context = None
                                         gc.collect()
-                                        try:
-                                            import sys
-                                            if hasattr(sys.intern, 'clear'):
-                                                sys.intern.clear()
-                                        except Exception as e:
-                                            logging.debug(f"Could not clear interned strings: {e}")
-                                        gc.collect()
-                                        logging.info("Recreated CIContext to free memory")
+                                        logging.debug("Recreated CIContext to free memory")
                                         memory_to_free = memory_usage - 1500
                                         if memory_to_free > 0:
-                                            logging.warning(f"Attempting to free {memory_to_free:.2f} MB of memory")
+                                            logging.debug(f"Attempting to free {memory_to_free:.2f} MB of memory")
                                             with objc.autorelease_pool():
                                                 ci_context.clearCaches()
                                                 minimal_options = {
@@ -1326,19 +1710,37 @@ def main():
 
             memory_usage = process.memory_info().rss / 1024 / 1024
             if memory_usage > 2000:
-                logging.warning(f"High memory usage detected: {memory_usage:.2f} MB")
+                logging.debug(f"High memory usage detected: {memory_usage:.2f} MB")
 
             if current_time - last_status_time > 5.0:
                 if frames_since_last_log > 0:
                     avg_process_time = total_process_time / frames_since_last_log * 1000
                     summary_lines = [
                         f"===== PERFORMANCE SUMMARY =====",
-                        f"Configuration: Grid {grid_size}x{grid_size}, Depth {depth}, Mode: {'DEBUG' if debug_mode else 'GRID'}",
+                    ]
+                    
+                    # Only show depth in grid mode
+                    if mode == "grid":
+                        summary_lines.append(f"Configuration: Grid {grid_size}x{grid_size}, Depth {depth}, Mode: {mode.upper()}")
+                    else:
+                        position_desc = {
+                            1: "top-left",
+                            2: "center",
+                            3: "top-right"
+                        }
+                        # Special case for 2x2 grid in position 2
+                        if fractal_source_position == 2 and fractal_grid_size == 2:
+                            summary_lines.append(f"Configuration: Fractal {fractal_grid_size}x{fractal_grid_size}, Source: top-right (special 2x2 case), Mode: {mode.upper()}")
+                        else:
+                            summary_lines.append(f"Configuration: Fractal {fractal_grid_size}x{fractal_grid_size}, Source: {position_desc[fractal_source_position]}, Mode: {mode.upper()}")
+                    
+                    summary_lines.extend([
                         f"Frames: Captured {frame_count}, Displayed {displayed_count}, Dropped {dropped_count}",
                         f"Processing: Min {min_process_time * 1000:.1f}ms, Max {max_process_time * 1000:.1f}ms, Avg {avg_process_time:.1f}ms",
                         f"Success Rate: {successful_grids_since_last_log}/{frames_since_last_log} frames processed successfully",
                         f"FPS: {int(clock.get_fps())}"
-                    ]
+                    ])
+                    
                     hw_line = "Hardware Acceleration: "
                     if hardware_acceleration_available:
                         hw_line += "Enabled"
@@ -1354,7 +1756,18 @@ def main():
                         last_original, last_small = downsample_sizes[-1]
                         reduction_ratio = last_original / max(1, last_small)
                         summary_lines.append(f"Downsampling: {avg_downsample_time:.1f}ms, Reduction Ratio: {reduction_ratio:.1f}x")
-                    if not debug_mode and depth > 0:
+                    
+                    # Add memory cleanup stats to summary
+                    if is_apple_silicon and hardware_acceleration_available:
+                        summary_lines.append(f"Memory Management: {cleanup_stats['total_cleanups']} cleanups ({cleanup_stats['extra_cleanups']} emergency), interval: {cleanup_stats['current_interval']:.1f}s")
+                        
+                    try:
+                        memory_usage = process.memory_info().rss / 1024 / 1024
+                        summary_lines.append(f"Current Process Memory Usage (Hardware-level): {memory_usage:.2f} MB")
+                    except Exception:
+                        pass
+                    
+                    if not debug_mode and depth > 0 and mode == "grid":
                         summary_lines.append("\nGrid Layer Breakdown:")
                         layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
                         for layer in layer_info:
@@ -1368,8 +1781,6 @@ def main():
                         for stat in top_stats[:5]:
                             summary_lines.append(f"  {stat}")
                     
-                    memory_usage = process.memory_info().rss / 1024 / 1024
-                    summary_lines.append(f"Current Process Memory Usage (Hardware-level): {memory_usage:.2f} MB")
                     for line in summary_lines:
                         logging.info(line)
                 frames_since_last_log = 0
