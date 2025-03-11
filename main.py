@@ -12,7 +12,10 @@ from dotenv import load_dotenv
 import traceback
 import gc
 import pygame
-import Quartz  # For Core Graphics functions
+import Quartz
+import tracemalloc
+import psutil
+from memory_profiler import profile
 
 # Load environment variables
 load_dotenv()
@@ -21,16 +24,30 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def configure_logging(level_name):
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.getLogger().setLevel(level)
+    """Configure logging level based on input string."""
+    try:
+        level = getattr(logging, level_name.upper(), logging.INFO)
+        logging.getLogger().setLevel(level)
+    except AttributeError as e:
+        logging.error(f"Invalid log level '{level_name}': {e}")
+        logging.getLogger().setLevel(logging.INFO)
 
-# Load hardware acceleration settings from environment
+# Load hardware acceleration settings
 force_hardware_acceleration = os.getenv('FORCE_HARDWARE_ACCELERATION', 'true').lower() == 'true'
 allow_software_fallback = os.getenv('ALLOW_SOFTWARE_FALLBACK', 'false').lower() == 'true'
 
-# Check for Apple Silicon and initialize hardware acceleration
+# Load memory tracing settings
+enable_memory_tracing = os.getenv('ENABLE_MEMORY_TRACING', 'false').lower() == 'true'
+
+# Global variables for hardware acceleration
 is_apple_silicon = platform.system() == 'Darwin' and platform.machine().startswith('arm')
 hardware_acceleration_available = False
+ci_context = None
+context_options = {}
+
+# Global variables for memory management
+cleanup_thread_running = False
+memory_cleanup_thread = None
 
 if is_apple_silicon:
     try:
@@ -39,40 +56,84 @@ if is_apple_silicon:
         from Quartz import CIContext, CIImage, CIFilter, kCIFormatRGBA8, kCIContextUseSoftwareRenderer, CIVector
         from CoreFoundation import CFDataCreate
         
-        # Create an optimized Core Image context specifically for Apple Silicon
-        # Setting advanced options for maximum hardware acceleration
+        logging.info("Detected Apple Silicon, attempting to initialize hardware acceleration")
+        
         context_options = {
-            kCIContextUseSoftwareRenderer: False,              # Force GPU rendering
-            "kCIContextOutputColorSpace": None,                # Use device color space
-            "kCIContextWorkingColorSpace": None,               # Use device color space
-            "kCIContextHighQualityDownsample": False,          # Prioritize speed over quality
-            "kCIContextOutputPremultiplied": True,             # Pre-multiplied alpha for speed
-            "kCIContextCacheIntermediates": True,              # Cache intermediate results
-            "kCIContextPriorityRequestLow": False              # High priority processing
+            kCIContextUseSoftwareRenderer: False,
+            "kCIContextOutputColorSpace": None,
+            "kCIContextWorkingColorSpace": None,
+            "kCIContextHighQualityDownsample": False,
+            "kCIContextOutputPremultiplied": True,
+            "kCIContextCacheIntermediates": False,
+            "kCIContextPriorityRequestLow": True,
+            "kCIContextWorkingFormat": kCIFormatRGBA8,
+            "kCIContextAllowLowPower": True,
+            "kCIContextAllowReductions": True,
+            "kCIContextUseSoftwareRenderer": False,
+            "kCIContextUsesCoreGraphics": False,
+            "kCIContextEnableMetalRenderingAtHighPerformance": True
         }
         
-        # Create the optimized context
-        ci_context = CIContext.contextWithOptions_(context_options)
-        hardware_acceleration_available = True
-        logging.info("Hardware acceleration enabled and optimized for Apple Silicon")
+        with objc.autorelease_pool():
+            ci_context = CIContext.contextWithOptions_(context_options)
+        
+        if ci_context is None:
+            logging.error("CIContext initialization returned None")
+            if force_hardware_acceleration and not allow_software_fallback:
+                raise RuntimeError("CIContext initialization returned None and hardware acceleration is required")
+        else:
+            test_width, test_height = 4, 4
+            test_img = np.zeros((test_height, test_width, 4), dtype=np.uint8)
+            test_img[:,:] = (255, 0, 0, 255)
+            
+            if not test_img.flags['C_CONTIGUOUS']:
+                test_img = np.ascontiguousarray(test_img)
+            
+            with objc.autorelease_pool():
+                test_data = test_img.tobytes()
+                data_provider = CFDataCreate(None, test_data, len(test_data))
+                
+                if data_provider is not None:
+                    test_ci_image = CIImage.imageWithBitmapData_bytesPerRow_size_format_colorSpace_(
+                        data_provider, test_width * 4, Quartz.CGSizeMake(test_width, test_height), kCIFormatRGBA8, None)
+                    del data_provider
+                    
+                    if test_ci_image is not None:
+                        optimized_image = test_ci_image.imageBySettingProperties_({"CIImageAppleM1Optimized": True})
+                        del test_ci_image
+                        
+                        if optimized_image is not None:
+                            logging.info("Hardware acceleration test successful!")
+                            hardware_acceleration_available = True
+                            del optimized_image
+                        else:
+                            logging.warning("Failed to optimize test image for Apple M1")
+                    else:
+                        logging.warning("Failed to create CIImage from test data")
+            gc.collect()
     except ImportError as e:
+        logging.error(f"Failed to import Apple-specific modules: {e}\n{traceback.format_exc()}")
         if force_hardware_acceleration and not allow_software_fallback:
-            logging.error(f"Hardware acceleration required but unavailable: {e}")
-            raise RuntimeError("Hardware acceleration required but unavailable. Set ALLOW_SOFTWARE_FALLBACK=true to allow software processing.")
-        logging.warning(f"Hardware acceleration unavailable, falling back to software processing: {e}")
+            raise RuntimeError("Hardware acceleration required but unavailable. Set ALLOW_SOFTWARE_FALLBACK=true to continue.")
+        logging.warning("Hardware acceleration unavailable, falling back to software processing.")
+    except Exception as e:
+        logging.error(f"Unexpected error initializing CIContext: {e}\n{traceback.format_exc()}")
+        if force_hardware_acceleration and not allow_software_fallback:
+            raise RuntimeError("Hardware acceleration setup failed. Set ALLOW_SOFTWARE_FALLBACK=true to continue.")
+        logging.warning("Hardware acceleration setup failed, falling back to software processing.")
 else:
     if force_hardware_acceleration and not allow_software_fallback:
-        logging.error("Hardware acceleration required but not running on Apple Silicon")
-        raise RuntimeError("Hardware acceleration required but not running on Apple Silicon. Set ALLOW_SOFTWARE_FALLBACK=true to allow software processing.")
-    logging.info("Not running on Apple Silicon, using software processing")
+        logging.error("Hardware acceleration required but not on Apple Silicon")
+        raise RuntimeError("Hardware acceleration required but not on Apple Silicon. Set ALLOW_SOFTWARE_FALLBACK=true to continue.")
+    logging.info("Not on Apple Silicon, using software processing")
 
 # Global variables
 grid_size = 3
 depth = 1
 running = True
-debug_mode = True  # Start in debug mode
-show_info = True   # Whether to show the information overlay
-info_hidden_time = 0  # Timestamp when info was hidden
+debug_mode = True
+show_info = True
+info_hidden_time = 0
 
 # Stats
 frame_count = 0
@@ -83,941 +144,1301 @@ dropped_count = 0
 # Performance tracking
 downsample_times = []
 downsample_sizes = []
-max_tracked_samples = 50  # Keep tracking data for the last 50 frames
+max_tracked_samples = 50
 
-# Keyboard controls
+def conditional_profile(func):
+    """Only apply @profile decorator if memory tracing is enabled."""
+    global enable_memory_tracing
+    def dummy_decorator(f):
+        return f
+    decorator = profile if enable_memory_tracing else dummy_decorator
+    return decorator(func)
+
 def handle_keyboard_event(key_name):
+    """Handle keyboard inputs for adjusting grid settings."""
     global grid_size, depth, debug_mode, show_info, info_hidden_time
     
     old_grid_size = grid_size
     old_depth = depth
     old_debug_mode = debug_mode
     
-    if key_name == 'up':
-        grid_size += 1
-        logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
-    elif key_name == 'down' and grid_size > 1:
-        grid_size -= 1
-        logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
-    elif key_name in '1234567890':
-        try:
+    try:
+        if key_name == 'up':
+            grid_size += 1
+            logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+        elif key_name == 'down' and grid_size > 1:
+            grid_size -= 1
+            logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+        elif key_name in '1234567890':
             depth = int(key_name) if key_name != '0' else 10
             logging.info(f"Recursion depth changed: {old_depth} → {depth}")
-        except ValueError:
-            logging.warning(f"Invalid depth value: {key_name}")
-    elif key_name == 'd':
-        debug_mode = not debug_mode
-        mode_text = "enabled" if debug_mode else "disabled"
-        old_mode_text = "enabled" if old_debug_mode else "disabled"
-        logging.info(f"Debug mode changed: {old_mode_text} → {mode_text}")
-    elif key_name == 's':
-        show_info = not show_info
-        logging.info(f"Info overlay: {'shown' if show_info else 'hidden'}")
+        elif key_name == 'd':
+            debug_mode = not debug_mode
+            mode_text = "enabled" if debug_mode else "disabled"
+            old_mode_text = "enabled" if old_debug_mode else "disabled"
+            logging.info(f"Debug mode changed: {old_mode_text} → {mode_text}")
+        elif key_name == 's':
+            show_info = not show_info
+            logging.info(f"Info overlay: {'shown' if show_info else 'hidden'}")
+            if not show_info:
+                info_hidden_time = time.time()
         
-        # Record the time when info was hidden
-        if not show_info:
-            info_hidden_time = time.time()
-        
-    # Log detailed grid information after change
-    if old_grid_size != grid_size or old_depth != depth:
-        # Calculate expected cell sizes for the new configuration
-        frame_h, frame_w = 720, 1280  # Assume standard HD resolution
-        cell_h = frame_h // grid_size
-        cell_w = frame_w // grid_size
-        
-        # Calculate memory requirements and potential challenges
-        frame_size_mb = (frame_h * frame_w * 3) / (1024 * 1024)  # Size in MB (assuming 3 channels)
-        cell_size_mb = frame_size_mb / (grid_size * grid_size)
-        
-        # Log configuration details
-        logging.info(f"Configuration details for Grid {grid_size}x{grid_size}, Depth {depth}:")
-        logging.info(f"  - Cell size: ~{cell_w}x{cell_h} pixels")
-        logging.info(f"  - Total cells: {grid_size * grid_size} per frame")
-        logging.info(f"  - Estimated memory per frame: {frame_size_mb:.2f} MB")
-        logging.info(f"  - Estimated memory per cell: {cell_size_mb:.4f} MB")
+        if old_grid_size != grid_size or old_depth != depth:
+            frame_h, frame_w = 720, 1280
+            cell_h = frame_h // grid_size
+            cell_w = frame_w // grid_size
+            
+            frame_size_mb = (frame_h * frame_w * 3) / (1024 * 1024)
+            cell_size_mb = frame_size_mb / (grid_size * grid_size)
+            
+            logging.info(f"Configuration details for Grid {grid_size}x{grid_size}, Depth {depth}:")
+            logging.info(f"  - Cell size: ~{cell_w}x{cell_h} pixels")
+            logging.info(f"  - Total cells: {grid_size * grid_size} per frame")
+            logging.info(f"  - Estimated memory per frame: {frame_size_mb:.2f} MB")
+            logging.info(f"  - Estimated memory per cell: {cell_size_mb:.4f} MB")
+    except Exception as e:
+        logging.error(f"Error in handle_keyboard_event with key '{key_name}': {e}\n{traceback.format_exc()}")
 
-# Signal handler for graceful shutdown
 def signal_handler(sig, frame):
+    """Handle keyboard interrupts and other signals."""
     global running
-    print("\nShutting down...")
+    signal_name = signal.Signals(sig).name
+    logging.info(f"Received signal {signal_name} ({sig}), shutting down gracefully...")
     running = False
 
-signal.signal(signal.SIGINT, signal_handler)
-
-# Hardware-accelerated frame conversion functions
 def cv_to_ci_image(cv_img):
-    # Check if image is already in BGRA format to avoid unnecessary conversion
-    if cv_img.shape[2] == 3:
-        cv_img_rgba = cv2.cvtColor(cv_img, cv2.COLOR_BGR2BGRA)
-    else:
-        cv_img_rgba = cv_img.copy()  # Already in BGRA format
+    """Convert OpenCV image to Core Image with autorelease pool for memory management."""
+    with objc.autorelease_pool():
+        data_provider = None
+        ci_img = None
+        optimized_ci_img = None
+        data = None
+        cv_img_rgba = None
+        result = None
         
-    height, width = cv_img_rgba.shape[:2]
-    
-    # Use contiguous C-style memory layout for better performance
-    if not cv_img_rgba.flags['C_CONTIGUOUS']:
-        cv_img_rgba = np.ascontiguousarray(cv_img_rgba)
-    
-    data = cv_img_rgba.tobytes()
-    data_provider = CFDataCreate(None, data, len(data))
-    
-    # Use optimized format for Apple Silicon
-    ci_img = CIImage.imageWithBitmapData_bytesPerRow_size_format_colorSpace_(
-        data_provider, width * 4, Quartz.CGSizeMake(width, height), kCIFormatRGBA8, None)
-        
-    # Explicitly hint for hardware processing by setting properties
-    ci_img = ci_img.imageBySettingProperties_({
-        "CIImageAppleM1Optimized": True
-    })
-    
-    return ci_img
+        try:
+            if cv_img is None or cv_img.size == 0:
+                logging.error("Input image to cv_to_ci_image is None or empty")
+                return None
+            
+            if not hardware_acceleration_available:
+                if force_hardware_acceleration:
+                    logging.warning("Hardware acceleration unavailable but forced - attempting to use CoreImage anyway")
+                else:
+                    logging.debug("Hardware acceleration unavailable, using software processing")
+            
+            if len(cv_img.shape) < 3:
+                cv_img_rgba = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGRA)
+            elif cv_img.shape[2] == 3:
+                cv_img_rgba = cv2.cvtColor(cv_img, cv2.COLOR_BGR2BGRA)
+            else:
+                cv_img_rgba = cv_img.copy()
+            
+            if cv_img_rgba is None or cv_img_rgba.size == 0:
+                logging.error("Failed to convert image to RGBA format")
+                return None
+                
+            height, width = cv_img_rgba.shape[:2]
+            
+            if not cv_img_rgba.flags['C_CONTIGUOUS']:
+                temp = cv_img_rgba
+                cv_img_rgba = np.ascontiguousarray(cv_img_rgba)
+                del temp
+            
+            data = cv_img_rgba.tobytes()
+            
+            data_provider = CFDataCreate(None, data, len(data))
+            if data_provider is None:
+                error_msg = "Failed to create CFData for CIImage"
+                logging.error(error_msg)
+                if force_hardware_acceleration and not allow_software_fallback:
+                    raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+                return None
+            
+            ci_img = CIImage.imageWithBitmapData_bytesPerRow_size_format_colorSpace_(
+                data_provider, width * 4, Quartz.CGSizeMake(width, height), kCIFormatRGBA8, None)
+            
+            del data_provider
+            data_provider = None
+            del data
+            data = None
+            del cv_img_rgba
+            cv_img_rgba = None
+            
+            if ci_img is None:
+                error_msg = "CIImage creation failed"
+                logging.error(error_msg)
+                if force_hardware_acceleration and not allow_software_fallback:
+                    raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+                return None
+            
+            optimized_ci_img = ci_img.imageBySettingProperties_({"CIImageAppleM1Optimized": True})
+            
+            if optimized_ci_img is not None:
+                result = optimized_ci_img
+                del ci_img
+                ci_img = None
+            else:
+                logging.warning("Failed to optimize CIImage for Apple M1, using unoptimized image")
+                result = ci_img
+                ci_img = None
+            
+            if ci_context is not None:
+                try:
+                    ci_context.clearCaches()
+                except Exception as e:
+                    logging.warning(f"Failed to clear CI context cache: {e}")
+            
+            gc.collect()
+            
+            return result
+                
+        except Exception as e:
+            error_msg = f"Error in cv_to_ci_image: {e}"
+            logging.error(f"{error_msg}\n{traceback.format_exc()}")
+            if force_hardware_acceleration and not allow_software_fallback:
+                raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+            return None
+        finally:
+            if data_provider is not None:
+                del data_provider
+            if data is not None:
+                del data
+            if cv_img_rgba is not None:
+                del cv_img_rgba
+            if ci_img is not None:
+                del ci_img
+            if optimized_ci_img is not None and optimized_ci_img != result:
+                del optimized_ci_img
 
 def ci_to_cv_image(ci_img, width, height):
-    # Create optimized buffer with proper alignment for Apple Silicon (16-byte alignment)
-    buffer_size = height * width * 4
-    aligned_size = ((buffer_size + 15) // 16) * 16  # Align to 16 bytes
-    output_data = NSMutableData.dataWithLength_(aligned_size)
-    
-    # Use low-overhead rendering mode
-    ci_context.render_toBitmap_rowBytes_bounds_format_colorSpace_(
-        ci_img, output_data.mutableBytes(), width * 4, Quartz.CGRectMake(0, 0, width, height),
-        kCIFormatRGBA8, None)
-    
-    try:
-        # Create numpy array without copying data
-        buffer = np.frombuffer(output_data, dtype=np.uint8)
+    """Convert Core Image to OpenCV image with autorelease pool for memory management."""
+    with objc.autorelease_pool():
+        output_data = None
+        buffer = None
+        buffer_copy = None
+        cv_img_result = None
         
-        # Check if the buffer size matches the expected dimensions
-        expected_size = height * width * 4
-        actual_size = buffer.size
-        
-        if actual_size != expected_size:
-            # Create a more detailed log message for buffer size mismatch
-            mismatch_details = (
-                f"Buffer size mismatch: expected {expected_size} ({width}x{height}x4), "
-                f"got {actual_size} (diff: {actual_size - expected_size} bytes). "
-                f"This typically happens with grid size transitions."
-            )
-            
-            # Log more details about the dimensions
-            if actual_size < expected_size:
-                logging.warning(f"{mismatch_details} Buffer is too small - will adjust dimensions.")
-            else:
-                logging.warning(f"{mismatch_details} Buffer is too large - will adjust dimensions.")
-            
-            # Calculate the closest dimensions that match the buffer size
-            # Try to maintain aspect ratio as much as possible
-            adjusted_height = int(np.sqrt((actual_size / 4) * (height / width)))
-            adjusted_width = int(actual_size / (4 * adjusted_height))
-            
-            logging.debug(f"Initial adjustment: {width}x{height} → {adjusted_width}x{adjusted_height}")
-            
-            # Make a final adjustment to ensure exact size match
-            adjustment_iterations = 0
-            max_iterations = 10  # Prevent infinite loops
-            while (adjusted_height * adjusted_width * 4) != actual_size and adjustment_iterations < max_iterations:
-                adjustment_iterations += 1
-                old_width, old_height = adjusted_width, adjusted_height
-                
-                if (adjusted_height * adjusted_width * 4) < actual_size:
-                    adjusted_width += 1
-                else:
-                    adjusted_width -= 1
-                
-                # If width adjustment doesn't work, try height
-                if (adjusted_height * adjusted_width * 4) != actual_size:
-                    if (adjusted_height * adjusted_width * 4) < actual_size:
-                        adjusted_height += 1
-                    else:
-                        adjusted_height -= 1
-                
-                logging.debug(f"Adjustment iteration {adjustment_iterations}: {old_width}x{old_height} → {adjusted_width}x{adjusted_height}")
-            
-            # Update the dimensions
-            height, width = adjusted_height, adjusted_width
-            logging.debug(f"Final dimensions: {width}x{height} (buffer size: {actual_size}, expected: {height * width * 4})")
-        
-        # Reshape with the potentially adjusted dimensions
-        buffer = buffer[:height * width * 4].reshape(height, width, 4)
-        
-        # For BGR output (3 channels), perform efficient conversion
-        if buffer.shape[2] == 4:
-            cv_img = cv2.cvtColor(buffer, cv2.COLOR_BGRA2BGR)
-        else:
-            cv_img = buffer[:,:,:3]  # Just take the first 3 channels if already BGR
-            
-        return cv_img
-        
-    except Exception as e:
-        # Enhanced error reporting for reshape errors
-        error_message = str(e)
-        if "reshape" in error_message:
-            logging.error(
-                f"Reshape error: {error_message}. Buffer size: {buffer.size}, "
-                f"Target shape: ({height}, {width}, 4), Required size: {height * width * 4}. "
-                f"This typically happens with grid size transitions or memory alignment issues."
-            )
-        else:
-            logging.warning(f"Image conversion error: {e}. Falling back to copy-based approach.")
-        
-        # Copy the data to a new buffer with exact size
-        raw_data = np.array(output_data)
-        if raw_data.size >= width * height * 4:
-            # Truncate if necessary
-            raw_data = raw_data[:width * height * 4]
-            # Reshape and convert
-            buffer = raw_data.reshape(height, width, 4)
-            cv_img = cv2.cvtColor(buffer, cv2.COLOR_BGRA2BGR)
-            return cv_img
-        else:
-            # If all else fails, create a black image
-            logging.error(f"Buffer size {raw_data.size} is too small for {width}x{height}x4. Creating black image.")
-            return np.zeros((height, width, 3), dtype=np.uint8)
-
-# Generate a new grid frame from the entire previous frame
-def generate_grid_frame(previous_frame, grid_size, current_depth):
-    global downsample_times, downsample_sizes
-    
-    if previous_frame is None:
-        logging.error(f"Depth {current_depth}: Previous frame is None")
-        return None
-    h, w = previous_frame.shape[:2]
-    base_cell_h = h // grid_size
-    base_cell_w = w // grid_size
-    remainder_h = h % grid_size
-    remainder_w = w % grid_size
-
-    # Create a blank result frame
-    result = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # Frame aspect ratio (16:9)
-    frame_aspect = 16 / 9
-    
-    # Calculate the most common cell size (ignoring remainder distribution)
-    # This optimization allows us to generate a single downsampled image once
-    common_cell_h = base_cell_h
-    common_cell_w = base_cell_w
-    
-    # Calculate optimal downsampling size to maintain aspect ratio
-    # We'll generate one small version of the image with correct aspect ratio
-    if frame_aspect > common_cell_w / common_cell_h:
-        # Frame is wider than cell, scale based on height
-        small_h = int(common_cell_h)
-        small_w = int(small_h * frame_aspect)
-    else:
-        # Frame is taller than cell, scale based on width
-        small_w = int(common_cell_w)
-        small_h = int(small_w / frame_aspect)
-
-    # Ensure minimum dimensions
-    small_w = max(1, small_w)
-    small_h = max(1, small_h)
-
-    # Measure downsampling performance
-    downsample_start_time = time.time()
-    
-    # Downsample the input frame once using hardware acceleration
-    if is_apple_silicon and hardware_acceleration_available:
         try:
-            # Use Core Image for hardware-accelerated downsampling
-            ci_img = cv_to_ci_image(previous_frame)
-            scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
-            scale_filter.setValue_forKey_(ci_img, "inputImage")
+            if ci_img is None:
+                logging.error("Input CIImage to ci_to_cv_image is None")
+                return None
             
-            # Determine scale factor based on the smaller dimension
-            scale_factor = min(small_h / h, small_w / w)
-            scale_filter.setValue_forKey_(scale_factor, "inputScale")
-            scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+            if width <= 0 or height <= 0:
+                logging.error(f"Invalid dimensions for ci_to_cv_image: {width}x{height}")
+                return None
+                
+            if ci_context is None:
+                error_msg = "CIContext is None, cannot render CIImage"
+                logging.error(error_msg)
+                if force_hardware_acceleration and not allow_software_fallback:
+                    raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+                return None
             
-            # Get the downsampled image
-            small_ci = scale_filter.valueForKey_("outputImage")
+            try:
+                buffer_size = height * width * 4
+                aligned_size = ((buffer_size + 15) // 16) * 16
+                output_data = NSMutableData.dataWithLength_(aligned_size)
+                if output_data is None:
+                    error_msg = "Failed to allocate NSMutableData"
+                    logging.error(error_msg)
+                    if force_hardware_acceleration and not allow_software_fallback:
+                        raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+                    return None
+            except Exception as e:
+                logging.error(f"Failed to create output buffer: {e}")
+                return None
+                
+            try:
+                ci_context.render_toBitmap_rowBytes_bounds_format_colorSpace_(
+                    ci_img, output_data.mutableBytes(), width * 4, Quartz.CGRectMake(0, 0, width, height),
+                    kCIFormatRGBA8, None)
+                
+                ci_context.clearCaches()
+                ci_img = None
+                gc.collect()
+                
+            except Exception as e:
+                error_msg = f"CIContext.render failed: {e}"
+                logging.error(error_msg)
+                if force_hardware_acceleration and not allow_software_fallback:
+                    raise RuntimeError(f"{error_msg} and hardware acceleration is required")
+                return None
             
-            # Ensure the dimensions are aligned to 4 bytes for better buffer handling
-            # This helps avoid reshape errors by ensuring buffer sizes align properly
-            exact_w = int(w * scale_factor)
-            exact_h = int(h * scale_factor)
+            try:
+                buffer = np.frombuffer(output_data, dtype=np.uint8)
+            except Exception as e:
+                logging.error(f"Failed to create buffer from NSMutableData: {e}")
+                return None
+                
+            expected_size = height * width * 4
+            actual_size = buffer.size
             
-            # Adjust dimensions to ensure they're aligned to 4 pixels
-            # This helps prevent buffer size mismatches with Core Image
-            exact_w = (exact_w + 3) & ~3  # Round up to multiple of 4
-            exact_h = (exact_h + 3) & ~3  # Round up to multiple of 4
+            if actual_size != expected_size:
+                mismatch_details = (
+                    f"Buffer size mismatch: expected {expected_size} ({width}x{height}x4), "
+                    f"got {actual_size} (diff: {actual_size - expected_size} bytes)."
+                )
+                logging.warning(f"{mismatch_details} Adjusting dimensions.")
+                
+                try:
+                    adjusted_height = int(np.sqrt((actual_size / 4) * (height / width)))
+                    adjusted_width = int(actual_size / (4 * adjusted_height))
+                    height, width = adjusted_height, adjusted_width
+                except Exception as e:
+                    logging.error(f"Failed to adjust dimensions: {e}")
             
-            # Update our working dimensions
-            small_w = exact_w
-            small_h = exact_h
+            try:
+                if actual_size < height * width * 4:
+                    max_pixels = actual_size // 4
+                    adjusted_height = int(np.sqrt(max_pixels * (height / width)))
+                    adjusted_width = max_pixels // adjusted_height
+                    height, width = adjusted_height, adjusted_width
+                    
+                buffer_copy = buffer[:height * width * 4].reshape(height, width, 4).copy()
+            except Exception as e:
+                logging.error(f"Failed to reshape buffer: {e}")
+                return np.zeros((height, width, 3), dtype=np.uint8)
+                
+            del buffer
+            buffer = None
+            del output_data
+            output_data = None
             
-            # Log the exact dimensions we're using
-            logging.debug(f"Using aligned dimensions: {small_w}x{small_h}")
+            gc.collect()
             
-            # Create the downsampled frame with explicit dimensions
-            small_frame = ci_to_cv_image(small_ci, exact_w, exact_h)
+            try:
+                if buffer_copy.shape[2] == 4:
+                    cv_img_result = cv2.cvtColor(buffer_copy, cv2.COLOR_BGRA2BGR)
+                else:
+                    cv_img_result = buffer_copy[:, :, :3].copy()
+            except Exception as e:
+                logging.error(f"Failed to convert to BGR format: {e}")
+                return np.zeros((height, width, 3), dtype=np.uint8)
+                
+            del buffer_copy
+            buffer_copy = None
             
-            # Clean up Core Image objects
-            del ci_img, small_ci
-            logging.debug(f"Depth {current_depth}: Hardware downsampled frame to {small_w}x{small_h}")
+            gc.collect()
+            
+            return cv_img_result
         except Exception as e:
-            if force_hardware_acceleration and not allow_software_fallback:
-                logging.error(f"Hardware downsampling failed: {e}")
-                raise RuntimeError(f"Hardware acceleration required but failed: {e}")
-            else:
-                logging.warning(f"Hardware downsampling failed, falling back to software: {e}")
-                # Try software fallback with explicit integer dimensions
-                small_frame = cv2.resize(previous_frame, (int(small_w), int(small_h)), interpolation=cv2.INTER_AREA)
-    elif force_hardware_acceleration and not allow_software_fallback:
-        logging.error("Hardware acceleration required but not available")
-        raise RuntimeError("Hardware acceleration required but not available")
-    else:
-        # Software fallback
-        # Ensure dimensions are integers
-        small_w_int = int(small_w)
-        small_h_int = int(small_h)
-        small_frame = cv2.resize(previous_frame, (small_w_int, small_h_int), interpolation=cv2.INTER_AREA)
-        # Update dimensions to what was actually used
-        small_w = small_w_int
-        small_h = small_h_int
-        logging.debug(f"Depth {current_depth}: Software downsampled frame to {small_w}x{small_h}")
-    
-    # Ensure we have a valid downsampled frame before proceeding
-    if small_frame is None or small_frame.size == 0:
-        logging.error(f"Depth {current_depth}: Failed to create valid downsampled frame")
-        return None
+            logging.error(f"Error in ci_to_cv_image: {e}\n{traceback.format_exc()}")
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        finally:
+            if output_data is not None:
+                del output_data
+            if buffer is not None:
+                del buffer
+            if buffer_copy is not None:
+                del buffer_copy
+            if ci_context is not None:
+                try:
+                    ci_context.clearCaches()
+                except:
+                    pass
 
-    # Verify the shape and dimensions
-    small_h, small_w = small_frame.shape[:2]
-    if small_h <= 0 or small_w <= 0:
-        logging.error(f"Depth {current_depth}: Invalid downsampled frame dimensions: {small_w}x{small_h}")
-        return None
-
-    # Log actual dimensions for debugging
-    logging.debug(f"Depth {current_depth}: Using downsampled frame of size {small_w}x{small_h}")
-
-    # Record performance metrics
-    downsample_time = time.time() - downsample_start_time
-    downsample_times.append(downsample_time)
-    downsample_sizes.append((w * h, small_w * small_h))  # Original and downsampled sizes
-    
-    # Keep only the last N samples
-    if len(downsample_times) > max_tracked_samples:
-        downsample_times.pop(0)
-        downsample_sizes.pop(0)
-    
-    # Now iterate through grid and place the downsampled image in each cell
-    for i in range(grid_size):
-        for j in range(grid_size):
-            # Calculate actual cell size, distributing remainder pixels
-            cell_h = base_cell_h + (1 if i < remainder_h else 0)
-            cell_w = base_cell_w + (1 if j < remainder_w else 0)
-
-            # Calculate exact cell position to avoid gaps
-            # This ensures cells are placed edge-to-edge with no gaps
-            y_start = 0
-            for k in range(i):
-                y_start += base_cell_h + (1 if k < remainder_h else 0)
-
-            y_end = y_start + cell_h
-
-            x_start = 0
-            for k in range(j):
-                x_start += base_cell_w + (1 if k < remainder_w else 0)
-
-            x_end = x_start + cell_w
-
-            # Verify we're not exceeding frame boundaries
-            y_end = min(y_end, h)
-            x_end = min(x_end, w)
-
-            # Double-check cell dimensions after boundary adjustment
-            cell_h = y_end - y_start
-            cell_w = x_end - x_start
-
-            if cell_h < 1 or cell_w < 1:
-                # If cell is too small, fill with average color
-                avg_color = cv2.mean(small_frame)[:3]
-                result[y_start:y_end, x_start:x_end] = avg_color
-                continue
-            
-            # Crop the downsampled image to fit this cell (might need slight adjustments)
-            if frame_aspect > cell_w / cell_h:
-                # Frame is wider than cell, crop horizontally
-                # Ensure all slice indices are integers
-                # Calculate what width the downsampled image should be to maintain aspect ratio
-                required_width = int(small_h * (cell_w / cell_h))
-                crop_x = int((small_w - required_width) / 2)  # Center crop
-                # Ensure we don't have negative indices
-                crop_x = max(0, crop_x)
-                crop_w = min(required_width, small_w - crop_x)
-                
-                # Ensure all values are valid integers
-                crop_x = int(crop_x)
-                crop_w = int(crop_w)
-                
-                if crop_x + crop_w <= small_w:
-                    cell_img = small_frame[:, crop_x:crop_x + crop_w]
-                else:
-                    # In case of any edge case, just take what we can
-                    cell_img = small_frame[:, :small_w]
-            else:
-                # Frame is taller than cell, crop vertically
-                # Ensure all slice indices are integers
-                # Calculate what height the downsampled image should be to maintain aspect ratio
-                required_height = int(small_w * (cell_h / cell_w))
-                crop_y = int((small_h - required_height) / 2)  # Center crop
-                # Ensure we don't have negative indices
-                crop_y = max(0, crop_y)
-                crop_h = min(required_height, small_h - crop_y)
-                
-                # Ensure all values are valid integers
-                crop_y = int(crop_y)
-                crop_h = int(crop_h)
-                
-                if crop_y + crop_h <= small_h:
-                    cell_img = small_frame[crop_y:crop_y + crop_h, :]
-                else:
-                    # In case of any edge case, just take what we can
-                    cell_img = small_frame[:small_h, :]
-            
-            # Resize to exact cell dimensions if needed (should be minimal adjustment)
-            if cell_img.shape[0] != cell_h or cell_img.shape[1] != cell_w:
-                # Use INTER_LINEAR for better quality when upscaling slightly
-                interpolation = cv2.INTER_LINEAR if (cell_img.shape[0] < cell_h or cell_img.shape[1] < cell_w) else cv2.INTER_AREA
-                
-                # Ensure we're resizing to exact dimensions to avoid gaps
-                cell_img = cv2.resize(cell_img, (cell_w, cell_h), interpolation=interpolation)
-                
-                # Verify the resized image has the exact dimensions we need
-                if cell_img.shape[0] != cell_h or cell_img.shape[1] != cell_w:
-                    logging.warning(f"Resize failed to produce exact dimensions: got {cell_img.shape[:2]}, needed {cell_h}x{cell_w}")
-                    # Force exact dimensions by creating a new image and copying
-                    exact_cell = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-                    h_copy = min(cell_img.shape[0], cell_h)
-                    w_copy = min(cell_img.shape[1], cell_w)
-                    exact_cell[:h_copy, :w_copy] = cell_img[:h_copy, :w_copy]
-                    cell_img = exact_cell
-            
-            # Place the cell in the result frame
-            result[y_start:y_end, x_start:x_end] = cell_img
-    
-    # Clean up the downsampled frame
-    del small_frame
-    gc.collect()  # Force garbage collection
-    
-    # Verify there are no black pixels in the result (all zeros)
-    black_pixels = np.all(result == 0, axis=2)
-    if np.any(black_pixels):
-        # Count and log the number of black pixels
-        num_black = np.count_nonzero(black_pixels)
-        percent_black = (num_black / (h * w)) * 100
-        logging.debug(f"Depth {current_depth}: Found {num_black} black pixels ({percent_black:.4f}% of frame)")
+def fill_black_pixels(result, grid_size):
+    """Fill black pixels in the result image."""
+    try:
+        if result is None or result.size == 0:
+            logging.error("Input to fill_black_pixels is None or empty")
+            return
         
-        # Fill black pixels with nearest non-black neighbor
-        if percent_black > 0.01:  # More than 0.01% of the frame is black
-            if grid_size <= 10:  # For smaller grids, use pixel-by-pixel approach
-                # Simple approach: for each black pixel, find a non-black neighbor
-                y_coords, x_coords = np.where(black_pixels)
-                for y, x in zip(y_coords, x_coords):
-                    # Check 8-connected neighbors
-                    for dy in [-1, 0, 1]:
-                        for dx in [-1, 0, 1]:
-                            ny, nx = y + dy, x + dx
-                            if (0 <= ny < h and 0 <= nx < w and not black_pixels[ny, nx]):
-                                result[y, x] = result[ny, nx]
-                                break
-                        else:
-                            continue
-                        break
-            else:
-                # For larger grids, use a more efficient morphological approach
-                logging.debug(f"Using morphological operations to fill black lines")
-                # Create a mask of non-black pixels
-                mask = (~black_pixels).astype(np.uint8) * 255
-                # Dilate the mask to fill small gaps
+        h, w = result.shape[:2]
+        black_pixels = np.all(result == 0, axis=2)
+        if np.any(black_pixels):
+            num_black = np.count_nonzero(black_pixels)
+            percent_black = (num_black / (h * w)) * 100
+            logging.debug(f"Found {num_black} black pixels ({percent_black:.4f}% of frame)")
+            if percent_black > 0.01:
                 kernel = np.ones((3, 3), np.uint8)
-                dilated = cv2.dilate(mask, kernel, iterations=1)
-                # Create a mask of pixels to fill (black pixels that are next to non-black pixels)
-                fill_mask = (dilated > 0) & black_pixels
-                
-                # For each channel, use inpainting to fill the black areas
+                if grid_size <= 10:
+                    mask = (~black_pixels).astype(np.uint8)
+                    dilated_mask = cv2.dilate(mask, kernel, iterations=1)
+                    fill_mask = (dilated_mask == 1) & black_pixels
+                else:
+                    logging.debug("Using morphological operations for large grids")
+                    mask = (~black_pixels).astype(np.uint8) * 255
+                    dilated = cv2.dilate(mask, kernel, iterations=1)
+                    fill_mask = (dilated > 0) & black_pixels
                 for c in range(3):
                     channel = result[:, :, c]
-                    # Simple inpainting: dilate and use the dilated values for black pixels
                     dilated_channel = cv2.dilate(channel, kernel, iterations=1)
                     channel[fill_mask] = dilated_channel[fill_mask]
+    except Exception as e:
+        logging.error(f"Error in fill_black_pixels: {e}\n{traceback.format_exc()}")
 
-    logging.debug(f"Depth {current_depth}: Generated grid frame {w}x{h} with grid {grid_size}x{grid_size}")
-    return result
-
-# Apply grid effect across multiple frames with memory management
-def apply_grid_effect(frame, grid_size, depth):
-    if frame is None:
-        return None
-    if debug_mode or depth == 0:
-        logging.debug("Depth 0: Returning original frame (debug mode or depth=0)")
-        return frame.copy()
+@conditional_profile
+def generate_grid_frame(previous_frame, grid_size, current_depth):
+    """Generate a grid frame recursively with direct assignment to reduce memory usage."""
+    global downsample_times, downsample_sizes
+    
+    ci_img = None
+    scale_filter = None
+    small_ci = None
+    small_frame = None
     
     try:
-        previous_frame = frame.copy()  # Start with the original frame
+        if previous_frame is None or previous_frame.size == 0:
+            logging.error(f"Depth {current_depth}: Previous frame is None or empty")
+            return None
         
-        # Initialize a counter for failed attempts
+        h, w = previous_frame.shape[:2]
+        if h <= 0 or w <= 0:
+            logging.error(f"Depth {current_depth}: Invalid frame dimensions: {w}x{h}")
+            return None
+        
+        base_cell_h = h // grid_size
+        base_cell_w = w // grid_size
+        remainder_h = h % grid_size
+        remainder_w = w % grid_size
+
+        result = np.empty((h, w, 3), dtype=np.uint8)
+
+        frame_aspect = 16 / 9
+        common_cell_h = base_cell_h
+        common_cell_w = base_cell_w
+        
+        if frame_aspect > common_cell_w / common_cell_h:
+            small_h = int(common_cell_h)
+            small_w = int(small_h * frame_aspect)
+        else:
+            small_w = int(common_cell_w)
+            small_h = int(small_w / frame_aspect)
+
+        small_w = max(1, small_w)
+        small_h = max(1, small_h)
+
+        downsample_start_time = time.time()
+        
+        if is_apple_silicon and hardware_acceleration_available:
+            try:
+                import objc
+                with objc.autorelease_pool():
+                    ci_img = cv_to_ci_image(previous_frame)
+                    if ci_img is None:
+                        logging.error(f"Depth {current_depth}: Failed to convert frame to CIImage")
+                        return None
+                    
+                    scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
+                    if scale_filter is None:
+                        logging.error(f"Depth {current_depth}: Failed to create CILanczosScaleTransform filter")
+                        del ci_img
+                        ci_img = None
+                        return None
+                    
+                    scale_filter.setValue_forKey_(ci_img, "inputImage")
+                    scale_factor = min(small_h / h, small_w / w)
+                    scale_filter.setValue_forKey_(scale_factor, "inputScale")
+                    scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
+                    
+                    small_ci = scale_filter.valueForKey_("outputImage")
+                    
+                    del ci_img
+                    ci_img = None
+                    del scale_filter
+                    scale_filter = None
+                    
+                    gc.collect()
+                    
+                    if small_ci is None:
+                        logging.error(f"Depth {current_depth}: Failed to apply scale filter")
+                        return None
+                    
+                    exact_w = int(w * scale_factor)
+                    exact_h = int(h * scale_factor)
+                    exact_w = (exact_w + 3) & ~3
+                    exact_h = (exact_h + 3) & ~3
+                    small_w = exact_w
+                    small_h = exact_h
+                    logging.debug(f"Depth {current_depth}: Hardware downsampled frame to {small_w}x{small_h}")
+                    
+                    small_frame = ci_to_cv_image(small_ci, exact_w, exact_h)
+                    
+                    del small_ci
+                    small_ci = None
+                    
+                    ci_context.clearCaches()
+                    logging.debug("Cleared Core Image cache after downsampling")
+                
+                if small_frame is None:
+                    logging.error(f"Depth {current_depth}: Failed to convert CIImage back to CV image")
+                    return None
+                
+                gc.collect()
+            except Exception as e:
+                logging.error(f"Depth {current_depth}: Error in hardware downsampling: {e}\n{traceback.format_exc()}")
+                
+                if ci_img is not None:
+                    del ci_img
+                    ci_img = None
+                if small_ci is not None:
+                    del small_ci
+                    small_ci = None
+                if scale_filter is not None:
+                    del scale_filter
+                    scale_filter = None
+                
+                gc.collect()
+                
+                try:
+                    small_frame = cv2.resize(previous_frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+                    logging.warning(f"Depth {current_depth}: Falling back to software downsampling")
+                except Exception as resize_e:
+                    logging.error(f"Depth {current_depth}: Software resize also failed: {resize_e}")
+                    return None
+        else:
+            small_w_int = int(small_w)
+            small_h_int = int(small_h)
+            try:
+                small_frame = cv2.resize(previous_frame, (small_w_int, small_h_int), interpolation=cv2.INTER_AREA)
+            except cv2.error as e:
+                logging.error(f"Depth {current_depth}: OpenCV resize failed: {e}")
+                return None
+            small_w = small_w_int
+            small_h = small_h_int
+            logging.debug(f"Depth {current_depth}: Software downsampled frame to {small_w}x{small_h}")
+        
+        if small_frame is None or small_frame.size == 0:
+            logging.error(f"Depth {current_depth}: Failed to create valid downsampled frame")
+            return None
+
+        small_h, small_w = small_frame.shape[:2]
+        if small_h <= 0 or small_w <= 0:
+            logging.error(f"Depth {current_depth}: Invalid downsampled frame dimensions: {small_w}x{small_h}")
+            return None
+
+        logging.debug(f"Depth {current_depth}: Using downsampled frame of size {small_w}x{small_h}")
+
+        downsample_time = time.time() - downsample_start_time
+        downsample_times.append(downsample_time)
+        downsample_sizes.append((w * h, small_w * small_h))
+        
+        if len(downsample_times) > max_tracked_samples:
+            downsample_times.pop(0)
+            downsample_sizes.pop(0)
+        
+        cell_count = 0
+        total_cells = grid_size * grid_size
+        
+        for i in range(grid_size):
+            for j in range(grid_size):
+                cell_count += 1
+                
+                cell_h = base_cell_h + (1 if i < remainder_h else 0)
+                cell_w = base_cell_w + (1 if j < remainder_w else 0)
+                y_start = sum([base_cell_h + (1 if k < remainder_h else 0) for k in range(i)])
+                y_end = y_start + cell_h
+                x_start = sum([base_cell_w + (1 if k < remainder_w else 0) for k in range(j)])
+                x_end = x_start + cell_w
+                y_end = min(y_end, h)
+                x_end = min(x_end, w)
+                cell_h = y_end - y_start
+                cell_w = x_end - x_start
+                
+                if cell_h < 1 or cell_w < 1:
+                    logging.warning(f"Depth {current_depth}: Cell too small: {cell_w}x{cell_h}, using average color")
+                    avg_color = cv2.mean(small_frame)[:3]
+                    result[y_start:y_end, x_start:x_end] = avg_color
+                    continue
+                    
+                try:
+                    if frame_aspect > cell_w / cell_h:
+                        required_width = int(small_h * (cell_w / cell_h))
+                        crop_x = int((small_w - required_width) / 2)
+                        crop_x = max(0, crop_x)
+                        crop_w = min(required_width, small_w - crop_x)
+                        cropped = small_frame[:, crop_x:crop_x + crop_w] if crop_x + crop_w <= small_w else small_frame[:, :small_w]
+                    else:
+                        required_height = int(small_w * (cell_h / cell_w))
+                        crop_y = int((small_h - required_height) / 2)
+                        crop_y = max(0, crop_y)
+                        crop_h = min(required_height, small_h - crop_y)
+                        cropped = small_frame[crop_y:crop_y + crop_h, :] if crop_y + crop_h <= small_h else small_frame[:small_h, :]
+                        
+                    interpolation = cv2.INTER_LINEAR if (cropped.shape[0] < cell_h or cropped.shape[1] < cell_w) else cv2.INTER_AREA
+                    result[y_start:y_end, x_start:x_end] = cv2.resize(cropped, (cell_w, cell_h), interpolation=interpolation)
+                    
+                except Exception as e:
+                    logging.error(f"Error processing cell {i}x{j} at depth {current_depth}: {e}")
+                    result[y_start:y_end, x_start:x_end] = 0
+                
+                gc_frequency = max(10, total_cells // 10)
+                if cell_count % gc_frequency == 0:
+                    gc.collect()
+                    if grid_size > 16 and cell_count % (gc_frequency * 2) == 0 and ci_context is not None:
+                        try:
+                            ci_context.clearCaches()
+                        except Exception:
+                            pass
+        
+        del small_frame
+        small_frame = None
+        
+        gc.collect()
+        
+        fill_black_pixels(result, grid_size)
+
+        logging.debug(f"Depth {current_depth}: Generated grid frame {w}x{h} with grid {grid_size}x{grid_size}")
+        
+        return result
+    except Exception as e:
+        logging.error(f"Error in generate_grid_frame at depth {current_depth}: {e}\n{traceback.format_exc()}")
+        return None
+
+@conditional_profile
+def apply_grid_effect(frame, grid_size, depth):
+    """Apply recursive grid effect to the frame."""
+    previous_frame = None
+    result = None
+    
+    try:
+        if frame is None or frame.size == 0:
+            logging.warning("apply_grid_effect received None or empty frame")
+            return None
+        if debug_mode or depth == 0:
+            logging.debug("Depth 0: Returning original frame (debug mode or depth=0)")
+            return frame.copy()
+            
+        previous_frame = frame.copy()
         failed_depths = 0
-        max_failed_depths = 2  # Allow at most 2 failures before giving up
+        max_failed_depths = 2
         
         for d in range(1, depth + 1):
-            try:
+            if is_apple_silicon:
+                import objc
+                with objc.autorelease_pool():
+                    new_frame = generate_grid_frame(previous_frame, grid_size, d)
+                    
+                    if new_frame is None:
+                        logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
+                        failed_depths += 1
+                        if failed_depths > max_failed_depths:
+                            logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
+                            result = previous_frame.copy()
+                            del previous_frame
+                            previous_frame = None
+                            gc.collect()
+                            return result
+                        new_frame = previous_frame.copy()
+                    else:
+                        failed_depths = 0
+                    
+                    old_frame = previous_frame
+                    previous_frame = new_frame
+                    del old_frame
+                    new_frame = None
+                    
+                    gc.collect()
+                    
+                    if is_apple_silicon and hardware_acceleration_available:
+                        try:
+                            ci_context.clearCaches()
+                            logging.debug(f"Depth {d}: Cleared Core Image cache after processing")
+                        except Exception as e:
+                            logging.error(f"Depth {d}: Failed to clear Core Image cache: {e}")
+                
+                gc.collect()
+            else:
                 new_frame = generate_grid_frame(previous_frame, grid_size, d)
+                
                 if new_frame is None:
                     logging.error(f"Depth {d}: Failed to generate grid frame (returned None)")
                     failed_depths += 1
                     if failed_depths > max_failed_depths:
                         logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
-                        break
-                    # Use previous frame and continue
+                        result = previous_frame.copy()
+                        del previous_frame
+                        previous_frame = None
+                        gc.collect()
+                        return result
                     new_frame = previous_frame.copy()
                 else:
-                    # Reset failed depth counter on success
                     failed_depths = 0
-                    
-                # Replace previous frame with the new one and delete the old one
-                del previous_frame
-                previous_frame = new_frame
-                gc.collect()  # Force garbage collection after each depth
-            except Exception as e:
-                logging.error(f"Depth {d}: Error during grid generation: {e}")
-                failed_depths += 1
-                if failed_depths > max_failed_depths:
-                    logging.error(f"Too many failures ({failed_depths}), aborting grid effect")
-                    break
-                # Just continue with previous frame
                 
-        # Return the last successfully generated frame
-        return previous_frame
+                old_frame = previous_frame
+                previous_frame = new_frame
+                del old_frame
+                new_frame = None
+                
+                gc.collect()
+        
+        result = previous_frame.copy()
+        del previous_frame
+        previous_frame = None
+        gc.collect()
+        return result
     except Exception as e:
-        logging.error(f"Grid effect pipeline error: {e}")
-        # Return original frame as fallback
-        return frame.copy()
+        logging.error(f"Error in apply_grid_effect: {e}\n{traceback.format_exc()}")
+        if previous_frame is not None and id(previous_frame) != id(frame):
+            del previous_frame
+        return frame.copy() if frame is not None else None
+    finally:
+        if previous_frame is not None and id(previous_frame) != id(result) and id(previous_frame) != id(frame):
+            del previous_frame
+        if is_apple_silicon and hardware_acceleration_available and ci_context is not None:
+            try:
+                ci_context.clearCaches()
+            except:
+                pass
 
-# Fetch YouTube stream URL
 def get_stream_url(url):
+    """Retrieve streaming URL using yt-dlp."""
     try:
+        if not url or url.strip() == "":
+            logging.error("Empty URL provided to get_stream_url function")
+            return None
+            
+        logging.info(f"Attempting to get stream URL for: {url}")
         result = subprocess.run(["yt-dlp", "-f", "best", "--get-url", url],
                                 capture_output=True, text=True, check=True)
-        return result.stdout.strip()
+        stream_url = result.stdout.strip()
+        if not stream_url:
+            logging.error("yt-dlp returned an empty stream URL")
+            return None
+            
+        logging.info(f"Successfully retrieved stream URL")
+        return stream_url
+    except subprocess.CalledProcessError as e:
+        logging.error(f"yt-dlp failed with return code {e.returncode}: {e.stderr}")
+        return None
+    except FileNotFoundError:
+        logging.error("yt-dlp not found. Please install yt-dlp.")
+        return None
     except Exception as e:
-        logging.error(f"Error getting YouTube stream URL: {e}")
+        logging.error(f"Error getting stream URL: {e}\n{traceback.format_exc()}")
         return None
 
-# Update the get_grid_layer_breakdown function to include more units for large numbers
 def get_grid_layer_breakdown(grid_size, max_depth):
-    """
-    Calculate and format information about each grid layer.
-    
-    Args:
-        grid_size: The size of the grid (NxN)
-        max_depth: The maximum recursion depth
-        
-    Returns:
-        tuple: (list of layer descriptions, total screens, formatted total)
-    """
-    if max_depth <= 0 or grid_size <= 0:
+    """Calculate grid layer breakdown."""
+    try:
+        if max_depth <= 0 or grid_size <= 0:
+            return [], 0, "0"
+        layer_info = []
+        total_screens = 0
+        for d in range(1, max_depth + 1):
+            screens_at_depth = grid_size ** (2 * d)
+            total_screens += screens_at_depth
+            layer_desc = (f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} (total {screens_at_depth:,} screens)" 
+                          if d == 1 else 
+                          f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} of frame {d-1} = (total {screens_at_depth:,} screens)")
+            layer_info.append(layer_desc)
+        number_units = [
+            (1e6, "million"), (1e9, "billion"), (1e12, "trillion"), (1e15, "quadrillion"), (1e18, "quintillion"),
+            (1e21, "sextillion"), (1e24, "septillion"), (1e27, "octillion"), (1e30, "nonillion"), (1e33, "decillion"),
+            (1e36, "undecillion"), (1e39, "duodecillion"), (1e42, "tredecillion"), (1e45, "quattuordecillion"),
+            (1e48, "quindecillion"), (1e51, "sexdecillion"), (1e54, "septendecillion"), (1e57, "octodecillion"),
+            (1e60, "novemdecillion"), (1e63, "vigintillion")
+        ]
+        formatted_total = f"{total_screens:,}"
+        for threshold, unit in reversed(number_units):
+            if total_screens >= threshold:
+                value = total_screens / threshold
+                formatted_total = f"{total_screens:,} ({value:.2f} {unit})"
+                break
+        return layer_info, total_screens, formatted_total
+    except Exception as e:
+        logging.error(f"Error in get_grid_layer_breakdown: {e}\n{traceback.format_exc()}")
         return [], 0, "0"
-    
-    layer_info = []
-    total_screens = 0
-    
-    # Calculate screens at each layer
-    for d in range(1, max_depth + 1):
-        # For depth d, the number of screens is grid_size^(2*d)
-        # Each cell contains grid_size^2 subcells, and this compounds with depth
-        screens_at_depth = grid_size ** (2 * d)
-        total_screens += screens_at_depth
-        
-        # Format the layer information
-        if d == 1:
-            layer_desc = f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} (total {screens_at_depth:,} screens)"
-        else:
-            prev_screens = grid_size ** (2 * (d-1))
-            layer_desc = f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} of frame {d-1} = (total {screens_at_depth:,} screens)"
-        
-        layer_info.append(layer_desc)
-    
-    # Format the total with appropriate scale using an expanded set of units
-    # Define the units and their corresponding powers of 10
-    number_units = [
-        (1e6, "million"),
-        (1e9, "billion"),
-        (1e12, "trillion"),
-        (1e15, "quadrillion"),
-        (1e18, "quintillion"),
-        (1e21, "sextillion"),
-        (1e24, "septillion"),
-        (1e27, "octillion"),
-        (1e30, "nonillion"),
-        (1e33, "decillion"),
-        (1e36, "undecillion"),
-        (1e39, "duodecillion"),
-        (1e42, "tredecillion"),
-        (1e45, "quattuordecillion"),
-        (1e48, "quindecillion"),
-        (1e51, "sexdecillion"),
-        (1e54, "septendecillion"),
-        (1e57, "octodecillion"),
-        (1e60, "novemdecillion"),
-        (1e63, "vigintillion"),
-        (1e66, "unvigintillion"),
-        (1e69, "duovigintillion"),
-        (1e72, "trevigintillion"),
-        (1e75, "quattuorvigintillion"),
-        (1e78, "quinvigintillion"),
-        (1e81, "sexvigintillion"),
-        (1e84, "septenvigintillion"),
-        (1e87, "octovigintillion"),
-        (1e90, "novemvigintillion"),
-        (1e93, "trigintillion"),
-        (1e96, "untrigintillion"),
-        (1e99, "duotrigintillion"),
-        (1e100, "googol"),
-        (1e303, "centillion")
-    ]
-    
-    # Start with the basic formatted number
-    formatted_total = f"{total_screens:,}"
-    
-    # Find the appropriate unit
-    for threshold, unit in reversed(number_units):
-        if total_screens >= threshold:
-            value = total_screens / threshold
-            formatted_total = f"{total_screens:,} ({value:.2f} {unit})"
-            break
-    
-    # Special handling for absolutely massive numbers
-    if total_screens >= 1e303:
-        # Calculate the approximate power of 10
-        power = int(np.log10(total_screens))
-        if power >= 303:
-            formatted_total += f" (approximately 10^{power})"
-    
-    return layer_info, total_screens, formatted_total
 
-# Main application loop
-def main():
-    global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
-    global force_hardware_acceleration, allow_software_fallback
+def start_memory_cleanup_thread():
+    """Start a background thread to periodically clean memory."""
+    global cleanup_thread_running, memory_cleanup_thread
     
-    parser = argparse.ArgumentParser(description='Recursive Video Grid')
-    parser.add_argument('--grid-size', type=int, default=3)
-    parser.add_argument('--depth', type=int, default=1)
-    parser.add_argument('--youtube-url', type=str, default=os.getenv('YOUTUBE_URL'))
-    parser.add_argument('--log-level', type=str, default='INFO', 
-                        help='Logging level: DEBUG for all logs, INFO for summaries only (default: INFO)')
-    parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--force-hardware', action='store_true', help='Force hardware acceleration')
-    parser.add_argument('--allow-software', action='store_true', help='Allow software fallback if hardware acceleration fails')
-    
-    args = parser.parse_args()
-    grid_size, depth = args.grid_size, args.depth
-    configure_logging(args.log_level)
-    debug_mode = args.debug
-    show_info = True   # Whether to show the information overlay
-    
-    # Override environment settings with command-line options if provided
-    if args.force_hardware:
-        force_hardware_acceleration = True
-        logging.info("Hardware acceleration forced by command-line option")
-    if args.allow_software:
-        allow_software_fallback = True
-        logging.info("Software fallback allowed by command-line option")
-    
-    logging.info(f"Starting with debug={debug_mode} (toggle with 'd')")
-    logging.info(f"Hardware acceleration: forced={force_hardware_acceleration}, software fallback={allow_software_fallback}")
-    logging.info("Logging set to summary mode - detailed logs will appear every 5 seconds")
-    logging.info("For more detailed logs, set --log-level=DEBUG")
-
-    pygame.init()
-    screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
-    pygame.display.set_caption("Recursive Grid Livestream")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont("Arial", 24)
-
-    stream_url = get_stream_url(args.youtube_url)
-    if not stream_url:
-        logging.error("Failed to get stream URL")
+    if cleanup_thread_running:
+        logging.info("Memory cleanup thread already running")
         return
-
-    cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        logging.error("Failed to open video stream")
+    
+    try:
+        import psutil
+        import objc
+        import gc
+        import os
+        import time
+        import threading
+        import logging
+    except ImportError as e:
+        logging.error(f"Failed to import required modules for memory cleanup thread: {e}")
         return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    logging.debug(f"Capture resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-
-    # Loading screen
-    screen.fill((0, 0, 0))
-    loading_text = font.render("Loading video stream...", True, (255, 255, 255))
-    screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2,
-                               screen.get_height() // 2 - loading_text.get_height() // 2))
-    pygame.display.flip()
-
-    # Initialize variables for logging summary
-    last_frame_time = time.time()
-    last_gc_time = time.time()
-    last_status_time = time.time()
-    last_process_time = 0
     
-    # Stats for summarized logging
-    frames_since_last_log = 0
-    successful_grids_since_last_log = 0
-    failed_grids_since_last_log = 0
-    min_process_time = float('inf')
-    max_process_time = 0
-    total_process_time = 0
-    
-    while running:
-        current_time = time.time()
-        loop_start_time = current_time
-
-        # Handle events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                key = pygame.key.name(event.key)
-                if key in ['up', 'down', 'd', 's'] or key in '0123456789':
-                    handle_keyboard_event(key)
-
-        # Capture frame
-        ret, frame = cap.read()
-        if not ret:
-            logging.warning("Failed to read frame")
-            time.sleep(0.1)
-            continue
-        frame_count += 1
-
-        # Process frame
-        process_start_time = time.time()
+    def memory_cleanup_worker():
+        global cleanup_thread_running
+        cleanup_thread_running = True
+        cleanup_interval = 2.0
+        memory_history = []
+        history_size = 5
+        
         try:
+            current_process = psutil.Process(os.getpid())
+        except Exception as e:
+            logging.error(f"Failed to create process object for memory monitoring: {e}")
+            current_process = None
+        
+        try:
+            logging.info("Starting periodic memory cleanup thread")
+            while cleanup_thread_running:
+                time.sleep(cleanup_interval)
+                
+                try:
+                    if is_apple_silicon and hardware_acceleration_available and ci_context is not None:
+                        try:
+                            with objc.autorelease_pool():
+                                ci_context.clearCaches()
+                            logging.debug("Periodic Core Image cache cleanup")
+                        except Exception as e:
+                            logging.error(f"Error clearing CI cache in cleanup thread: {e}")
+                    
+                    try:
+                        gc.collect()
+                        if hasattr(gc, 'collect') and callable(getattr(gc, 'collect')):
+                            gc.collect(2)
+                    except Exception as e:
+                        logging.error(f"Error during garbage collection in cleanup thread: {e}")
+                    
+                    try:
+                        if current_process is not None:
+                            memory_usage = current_process.memory_info().rss / 1024 / 1024
+                            memory_history.append(memory_usage)
+                            
+                            if len(memory_history) > history_size:
+                                memory_history.pop(0)
+                            
+                            growth_rate = 0
+                            if len(memory_history) >= 2:
+                                growth_rate = memory_history[-1] - memory_history[0]
+                                
+                            if memory_usage > 1500 or growth_rate > 100:
+                                cleanup_interval = 1.0
+                                if growth_rate > 200:
+                                    logging.warning(f"Memory growing rapidly ({growth_rate:.2f} MB), performing extra cleanup")
+                                    if ci_context is not None:
+                                        try:
+                                            ci_context.clearCaches()
+                                        except Exception:
+                                            pass
+                                    try:
+                                        import sys
+                                        sys.modules.get('gc', {}).get('garbage', []).clear()
+                                    except Exception:
+                                        pass
+                                    for _ in range(3):
+                                        gc.collect()
+                            elif memory_usage > 1000:
+                                cleanup_interval = 1.5
+                            else:
+                                cleanup_interval = 2.0
+                    except Exception as e:
+                        logging.error(f"Error checking memory usage in cleanup thread: {e}")
+                        cleanup_interval = 2.0
+                        
+                except Exception as e:
+                    logging.error(f"Error in memory cleanup thread: {e}")
+                    time.sleep(1.0)
+        finally:
+            cleanup_thread_running = False
+            logging.info("Memory cleanup thread stopped")
+    
+    memory_cleanup_thread = threading.Thread(target=memory_cleanup_worker, 
+                                            name="MemoryCleanup", 
+                                            daemon=True)
+    memory_cleanup_thread.start()
+    
+def stop_memory_cleanup_thread():
+    """Stop the memory cleanup thread."""
+    global cleanup_thread_running, memory_cleanup_thread
+    
+    try:
+        if cleanup_thread_running and memory_cleanup_thread is not None:
+            logging.info("Stopping memory cleanup thread...")
+            cleanup_thread_running = False
+            
+            if memory_cleanup_thread.is_alive():
+                memory_cleanup_thread.join(timeout=1.0)
+                
+            memory_cleanup_thread = None
+            logging.info("Memory cleanup thread stopped")
+        else:
+            logging.debug("Memory cleanup thread not running or already stopped")
+    except Exception as e:
+        logging.error(f"Error stopping memory cleanup thread: {e}")
+        cleanup_thread_running = False
+        memory_cleanup_thread = None
+
+def main():
+    """Main function with fixed-size frame surface and scaling for display."""
+    global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
+    global force_hardware_acceleration, allow_software_fallback, enable_memory_tracing, ci_context, context_options
+    
+    screen = None
+    cap = None
+    frame = None
+    processed_frame = None
+    frame_surface = None
+    font = None
+    
+    try:
+        pygame.init()
+        pygame.mixer.quit()
+        pygame.display.set_caption("MultiMax Grid")
+        display_info = pygame.display.Info()
+        screen_width = min(1280, display_info.current_w - 100)
+        screen_height = min(720, display_info.current_h - 100)
+        screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+        
+        if is_apple_silicon and hardware_acceleration_available:
+            start_memory_cleanup_thread()
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        load_dotenv()
+        
+        youtube_url = os.getenv('YOUTUBE_URL')
+        if not youtube_url:
+            logging.error("No YouTube URL found in .env file. Please set YOUTUBE_URL in .env file.")
+            return
+            
+        parser = argparse.ArgumentParser(description='Recursive Video Grid')
+        parser.add_argument('--grid-size', type=int, default=3)
+        parser.add_argument('--depth', type=int, default=1)
+        parser.add_argument('--youtube-url', type=str, default=youtube_url)
+        parser.add_argument('--log-level', type=str, default='INFO')
+        parser.add_argument('--debug', action='store_true')
+        parser.add_argument('--force-hardware', action='store_true')
+        parser.add_argument('--allow-software', action='store_true')
+        parser.add_argument('--enable-memory-tracing', action='store_true')
+        parser.add_argument('--test-hardware-accel', action='store_true')
+        
+        args = parser.parse_args()
+        grid_size, depth = args.grid_size, args.depth
+        configure_logging(args.log_level)
+        debug_mode = args.debug
+        show_info = True
+        
+        if args.force_hardware:
+            force_hardware_acceleration = True
+            logging.info("Hardware acceleration forced via command line")
+        if args.allow_software:
+            allow_software_fallback = True
+            logging.info("Software fallback allowed via command line")
+        if args.enable_memory_tracing:
+            enable_memory_tracing = True
+            logging.info("Memory tracing enabled via command line")
+        
+        if args.test_hardware_accel:
+            logging.info("=== Running hardware acceleration diagnostics ===")
+            logging.info(f"Platform: {platform.system()}, Machine: {platform.machine()}")
+            logging.info(f"Is Apple Silicon: {is_apple_silicon}")
+            logging.info(f"Hardware acceleration forced: {force_hardware_acceleration}")
+            logging.info(f"Software fallback allowed: {allow_software_fallback}")
+            logging.info(f"Hardware acceleration available: {hardware_acceleration_available}")
+            
+            if is_apple_silicon:
+                if ci_context is None:
+                    logging.error("CIContext initialization failed")
+                else:
+                    logging.info("CIContext initialized successfully")
+                    test_width, test_height = 16, 16
+                    test_img = np.zeros((test_height, test_width, 4), dtype=np.uint8)
+                    test_img[:,:] = (255, 0, 0, 255)
+                    
+                    logging.info("Testing cv_to_ci_image...")
+                    ci_test_img = cv_to_ci_image(test_img)
+                    if ci_test_img is not None:
+                        logging.info("cv_to_ci_image test succeeded")
+                        logging.info("Testing ci_to_cv_image...")
+                        cv_result = ci_to_cv_image(ci_test_img, test_width, test_height)
+                        if cv_result is not None:
+                            logging.info("ci_to_cv_image test succeeded")
+                            logging.info("All hardware acceleration tests passed!")
+                        else:
+                            logging.error("ci_to_cv_image test failed")
+                    else:
+                        logging.error("cv_to_ci_image test failed")
+            
+            logging.info("Hardware acceleration diagnostics complete, exiting")
+            return
+            
+        logging.info(f"Starting with debug={debug_mode} (toggle with 'd')")
+        logging.info(f"Hardware acceleration: forced={force_hardware_acceleration}, software fallback={allow_software_fallback}")
+        logging.info(f"Memory tracing: {'enabled' if enable_memory_tracing else 'disabled'}")
+
+        if enable_memory_tracing:
+            tracemalloc.start()
+            logging.info("Memory tracing started")
+        
+        process = psutil.Process()
+
+        pygame.init()
+        screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+        pygame.display.set_caption("Recursive Grid Livestream")
+        clock = pygame.time.Clock()
+        font = pygame.font.SysFont("Arial", 24)
+
+        stream_url = get_stream_url(args.youtube_url)
+        if not stream_url:
+            logging.error(f"Failed to get stream URL for {args.youtube_url}")
+            logging.error("Please check that your YOUTUBE_URL in .env is valid and accessible")
+            logging.error("Exiting program due to missing stream URL")
+            return
+
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                logging.info(f"Attempting to open video stream (attempt {retry_count+1}/{max_retries})")
+                cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                if cap.isOpened():
+                    logging.info("Successfully opened video stream")
+                    break
+                else:
+                    logging.warning(f"Failed to open video stream on attempt {retry_count+1}")
+                    retry_count += 1
+                    time.sleep(1)
+            except Exception as e:
+                logging.error(f"Error opening video stream: {e}")
+                retry_count += 1
+                time.sleep(1)
+                
+        if cap is None or not cap.isOpened():
+            logging.error(f"Failed to open video stream after {max_retries} attempts: {stream_url}")
+            logging.error("Please check your internet connection and YouTube URL validity")
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        logging.debug(f"Capture resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+
+        # Initialize frame_surface with video frame dimensions
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_surface = pygame.Surface((frame_width, frame_height))
+
+        screen.fill((0, 0, 0))
+        loading_text = font.render("Loading video stream...", True, (255, 255, 255))
+        screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2,
+                                   screen.get_height() // 2 - loading_text.get_height() // 2))
+        pygame.display.flip()
+
+        last_frame_time = time.time()
+        last_status_time = time.time()
+        last_process_time = 0
+        frames_since_last_log = 0
+        successful_grids_since_last_log = 0
+        min_process_time = float('inf')
+        max_process_time = 0
+        total_process_time = 0
+        frame_counter = 0
+
+        while running:
+            current_time = time.time()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    key = pygame.key.name(event.key)
+                    if key in ['up', 'down', 'd', 's'] or key in '0123456789':
+                        handle_keyboard_event(key)
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                logging.warning(f"Failed to read frame from stream: {stream_url}")
+                time.sleep(0.1)
+                continue
+            frame_count += 1
+
+            process_start_time = time.time()
             processed_frame = apply_grid_effect(frame, grid_size, depth)
+            if processed_frame is None:
+                logging.warning("Processed frame is None, using original frame")
+                processed_frame = frame.copy()
             processed_count += 1
             last_process_time = time.time() - process_start_time
-            
-            # Update processing time stats
             frames_since_last_log += 1
             successful_grids_since_last_log += 1
             min_process_time = min(min_process_time, last_process_time)
             max_process_time = max(max_process_time, last_process_time)
             total_process_time += last_process_time
-            
-        except Exception as e:
-            logging.error(f"Error applying effect: {e}")
-            processed_frame = frame.copy()
-            dropped_count += 1
-            failed_grids_since_last_log += 1
 
-        # Display frame
-        try:
-            # Make sure we have a valid processed frame
-            if processed_frame is None or processed_frame.size == 0 or not hasattr(processed_frame, 'shape'):
-                logging.warning("Invalid processed frame, using original frame instead")
-                processed_frame = frame.copy()
-            
-            # Verify frame has valid dimensions
-            h, w = processed_frame.shape[:2]
-            if h <= 0 or w <= 0 or processed_frame.ndim < 2:
-                logging.warning(f"Processed frame has invalid dimensions: {processed_frame.shape}, using original frame")
-                processed_frame = frame.copy()
-            
-            # If we have hardware acceleration, use it for color conversion too
+            try:
+                if processed_frame.size == 0 or not hasattr(processed_frame, 'shape'):
+                    logging.warning("Invalid processed frame, using original frame")
+                    processed_frame = frame.copy()
+                h, w = processed_frame.shape[:2]
+                if h != frame_height or w != frame_width:
+                    logging.error(f"Processed frame has unexpected dimensions: {w}x{h}, expected {frame_width}x{frame_height}")
+                    continue
+                rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                rgb_frame_swapped = rgb_frame.swapaxes(0, 1)
+                pygame.surfarray.blit_array(frame_surface, rgb_frame_swapped)
+                scaled_surface = pygame.transform.scale(frame_surface, screen.get_size())
+                screen.blit(scaled_surface, (0, 0))
+                displayed_count += 1
+                
+                # Periodic cache clearing every 10 frames
+                if frame_count % 10 == 0 and ci_context is not None:
+                    ci_context.clearCaches()
+                
+                if show_info:
+                    hw_status = "Enabled" if hardware_acceleration_available else "Disabled"
+                    if is_apple_silicon and force_hardware_acceleration:
+                        hw_status += " (Forced)"
+                    if not hardware_acceleration_available and allow_software_fallback:
+                        hw_status += " (Software Fallback)"
+                    texts = [
+                        f"Grid: {grid_size}x{grid_size}, Depth: {depth}",
+                        f"Captured: {frame_count}, Displayed: {displayed_count}",
+                        f"Processing: {last_process_time * 1000:.1f}ms",
+                        f"FPS: {int(clock.get_fps())}",
+                        f"Hardware: {hw_status}",
+                    ]
+                    if downsample_times:
+                        avg_time = sum(downsample_times) / len(downsample_times) * 1000
+                        if len(downsample_sizes) > 0:
+                            last_original, last_small = downsample_sizes[-1]
+                            reduction_ratio = last_original / max(1, last_small)
+                            texts.append(f"Downsampling: {avg_time:.1f}ms, Reduction: {reduction_ratio:.1f}x")
+                    if not debug_mode and depth > 0:
+                        texts.append("")
+                        texts.append("Grid Layer Breakdown:")
+                        layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
+                        for layer in layer_info:
+                            texts.append(f"  {layer}")
+                        texts.append(f"  Total screens = {formatted_total}")
+                    texts.append(f"Mode: {'DEBUG' if debug_mode else 'GRID'} (press 'd' to toggle)")
+                    texts.append("")
+                    texts.append("")
+                    texts.append("Press s to show/hide this info, d to debug, up/down grid size, 1 - 0 multiply depth")
+                    line_height = 25
+                    padding = 20
+                    required_height = len(texts) * line_height + padding * 2
+                    info_surface = pygame.Surface((screen.get_width(), required_height), pygame.SRCALPHA)
+                    info_surface.fill((0, 0, 0, 128))
+                    for i, text in enumerate(texts):
+                        text_surface = font.render(text, True, (255, 255, 255))
+                        info_surface.blit(text_surface, (10, padding + i * line_height))
+                    screen.blit(info_surface, (0, 0))
+                else:
+                    time_since_hidden = current_time - info_hidden_time
+                    if time_since_hidden < 5.0:
+                        alpha = 128
+                        if time_since_hidden > 4.0:
+                            fade_progress = time_since_hidden - 4.0
+                            alpha = int(128 * (1.0 - fade_progress))
+                            alpha = max(0, min(128, alpha))
+                        min_height = 40
+                        min_info = pygame.Surface((screen.get_width(), min_height), pygame.SRCALPHA)
+                        min_info.fill((0, 0, 0, alpha))
+                        text_color = (255, 255, 255, min(255, alpha * 2))
+                        help_text = font.render("Press 's' to show info", True, text_color)
+                        min_info.blit(help_text, (10, 10))
+                        screen.blit(min_info, (0, screen.get_height() - min_height))
+                pygame.display.flip()
+            except pygame.error as e:
+                logging.error(f"Pygame display error: {e}\n{traceback.format_exc()}")
+                dropped_count += 1
+            except Exception as e:
+                logging.error(f"Display error: {e}\n{traceback.format_exc()}")
+                dropped_count += 1
+
             if is_apple_silicon and hardware_acceleration_available:
                 try:
-                    # Convert BGR to RGB using Core Image
-                    ci_img = cv_to_ci_image(processed_frame)
-                    color_filter = CIFilter.filterWithName_("CIColorMatrix")
-                    color_filter.setValue_forKey_(ci_img, "inputImage")
+                    memory_usage = process.memory_info().rss / 1024 / 1024
                     
-                    # BGR to RGB conversion matrix (swap red and blue channels)
-                    color_filter.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(0, 0, 1, 0), "inputRVector")
-                    color_filter.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(0, 1, 0, 0), "inputGVector")
-                    color_filter.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(1, 0, 0, 0), "inputBVector")
+                    if memory_usage > 1000:
+                        try:
+                            import objc
+                            with objc.autorelease_pool():
+                                pass
+                            logging.debug("Released Objective-C autorelease pool")
+                        except Exception as e:
+                            logging.warning(f"Failed to release autorelease pool: {e}")
                     
-                    rgb_ci = color_filter.valueForKey_("outputImage")
-                    h, w = processed_frame.shape[:2]
-                    rgb_frame = ci_to_cv_image(rgb_ci, w, h)
+                    if memory_usage > 1200:
+                        logging.info(f"Medium memory usage detected: {memory_usage:.2f} MB - performing cleanup")
+                        gc.collect()
+                        ci_context.clearCaches()
+                        
+                        for var_name in list(locals().keys()):
+                            if var_name not in ['ci_context', 'context_options', 'process', 'memory_usage'] and var_name[0] != '_':
+                                if var_name in locals():
+                                    del locals()[var_name]
                     
-                    # Clean up Core Image objects
-                    del ci_img, rgb_ci
+                    if memory_usage > 1800:
+                        logging.warning(f"High memory usage detected: {memory_usage:.2f} MB - performing context recreation")
+                        if is_apple_silicon:
+                            try:
+                                with objc.autorelease_pool():
+                                    old_context = ci_context
+                                    stricter_options = dict(context_options)
+                                    stricter_options["kCIContextCacheIntermediates"] = False
+                                    stricter_options["kCIContextPriorityRequestLow"] = True
+                                    new_context = CIContext.contextWithOptions_(stricter_options)
+                                    
+                                    if new_context is not None:
+                                        ci_context = new_context
+                                        del old_context
+                                        old_context = None
+                                        gc.collect()
+                                        try:
+                                            import sys
+                                            if hasattr(sys.intern, 'clear'):
+                                                sys.intern.clear()
+                                        except Exception as e:
+                                            logging.debug(f"Could not clear interned strings: {e}")
+                                        gc.collect()
+                                        logging.info("Recreated CIContext to free memory")
+                                        memory_to_free = memory_usage - 1500
+                                        if memory_to_free > 0:
+                                            logging.warning(f"Attempting to free {memory_to_free:.2f} MB of memory")
+                                            with objc.autorelease_pool():
+                                                ci_context.clearCaches()
+                                                minimal_options = {
+                                                    kCIContextUseSoftwareRenderer: False,
+                                                    "kCIContextCacheIntermediates": False,
+                                                    "kCIContextPriorityRequestLow": True
+                                                }
+                                                old_context = ci_context
+                                                ci_context = CIContext.contextWithOptions_(minimal_options)
+                                                del old_context
+                                                old_context = None
+                                            for _ in range(3):
+                                                gc.collect()
+                            except Exception as e:
+                                logging.error(f"Failed to recreate CIContext: {e}")
+                        else:
+                            logging.error("Failed to recreate CIContext")
                 except Exception as e:
-                    if force_hardware_acceleration and not allow_software_fallback:
-                        logging.error(f"Hardware color conversion failed: {e}")
-                        raise RuntimeError(f"Hardware acceleration required but failed: {e}")
+                    logging.error(f"Failed to clear Core Image cache: {e}\n{traceback.format_exc()}")
+
+            gc.collect()
+
+            if 'frame' in locals():
+                del frame
+            if 'processed_frame' in locals():
+                del processed_frame
+            if 'rgb_frame' in locals():
+                del rgb_frame
+
+            frame_counter += 1
+
+            memory_usage = process.memory_info().rss / 1024 / 1024
+            if memory_usage > 2000:
+                logging.warning(f"High memory usage detected: {memory_usage:.2f} MB")
+
+            if current_time - last_status_time > 5.0:
+                if frames_since_last_log > 0:
+                    avg_process_time = total_process_time / frames_since_last_log * 1000
+                    summary_lines = [
+                        f"===== PERFORMANCE SUMMARY =====",
+                        f"Configuration: Grid {grid_size}x{grid_size}, Depth {depth}, Mode: {'DEBUG' if debug_mode else 'GRID'}",
+                        f"Frames: Captured {frame_count}, Displayed {displayed_count}, Dropped {dropped_count}",
+                        f"Processing: Min {min_process_time * 1000:.1f}ms, Max {max_process_time * 1000:.1f}ms, Avg {avg_process_time:.1f}ms",
+                        f"Success Rate: {successful_grids_since_last_log}/{frames_since_last_log} frames processed successfully",
+                        f"FPS: {int(clock.get_fps())}"
+                    ]
+                    hw_line = "Hardware Acceleration: "
+                    if hardware_acceleration_available:
+                        hw_line += "Enabled"
+                        if force_hardware_acceleration:
+                            hw_line += " (Forced)"
                     else:
-                        logging.warning(f"Hardware color conversion failed, falling back to software: {e}")
-                        rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-            else:
-                # Software fallback
-                rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                
-            surface = pygame.surfarray.make_surface(rgb_frame.swapaxes(0, 1))
-            screen.blit(pygame.transform.scale(surface, screen.get_size()), (0, 0))
-            displayed_count += 1
-
-            # Only show the overlay if show_info is True
-            if show_info:
-                # Overlay stats - first prepare all text items
-                hw_status = "Enabled" if hardware_acceleration_available else "Disabled"
-                if is_apple_silicon and force_hardware_acceleration:
-                    hw_status += " (Forced)"
-                if not hardware_acceleration_available and allow_software_fallback:
-                    hw_status += " (Software Fallback)"
-                
-                texts = [
-                    f"Grid: {grid_size}x{grid_size}, Depth: {depth}",
-                    f"Captured: {frame_count}, Displayed: {displayed_count}",
-                    f"Processing: {last_process_time * 1000:.1f}ms",
-                    f"FPS: {int(clock.get_fps())}",
-                    f"Hardware: {hw_status}",
-                ]
-
-                # Add downsampling performance metrics if available
-                if downsample_times:
-                    avg_time = sum(downsample_times) / len(downsample_times) * 1000  # Convert to ms
-                    if len(downsample_sizes) > 0:
+                        hw_line += "Disabled"
+                        if allow_software_fallback:
+                            hw_line += " (Software Fallback)"
+                    summary_lines.append(hw_line)
+                    if downsample_times and downsample_sizes:
+                        avg_downsample_time = sum(downsample_times) / len(downsample_times) * 1000
                         last_original, last_small = downsample_sizes[-1]
                         reduction_ratio = last_original / max(1, last_small)
-                        texts.append(f"Downsampling: {avg_time:.1f}ms, Reduction: {reduction_ratio:.1f}x")
-
-                # Add grid layer breakdown if not in debug mode and depth > 0
-                if not debug_mode and depth > 0:
-                    texts.append("")  # Add a blank line for spacing
-                    texts.append("Grid Layer Breakdown:")
-                    layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
-                    for layer in layer_info:
-                        texts.append(f"  {layer}")
-                    texts.append(f"  Total screens = {formatted_total}")
-
-                texts.append(f"Mode: {'DEBUG' if debug_mode else 'GRID'} (press 'd' to toggle)")
-                
-                # Add blank lines for spacing
-                texts.append("")
-                texts.append("")
-                
-                # Add the help text at the bottom
-                texts.append("Press s to show/hide this info, d to debug, up/down grid size, 1 - 0 multiply depth")
-
-                # Calculate required height based on number of text lines
-                line_height = 25  # Height per line of text
-                padding = 20      # Padding at top and bottom
-                required_height = len(texts) * line_height + padding * 2
-
-                # Create a surface with the calculated height
-                info_surface = pygame.Surface((screen.get_width(), required_height), pygame.SRCALPHA)
-                info_surface.fill((0, 0, 0, 128))
-
-                # Render all text items
-                for i, text in enumerate(texts):
-                    text_surface = font.render(text, True, (255, 255, 255))
-                    info_surface.blit(text_surface, (10, padding + i * line_height))
-                
-                screen.blit(info_surface, (0, 0))
-            else:
-                # When info is hidden, show a temporary help message
-                current_time = time.time()
-                time_since_hidden = current_time - info_hidden_time
-                
-                # Only show the message for 5 seconds
-                if time_since_hidden < 5.0:
-                    # Calculate fade-out effect for the last second
-                    alpha = 128  # Default opacity
-                    if time_since_hidden > 4.0:
-                        # Linear fade from 128 to 0 during the last second
-                        fade_progress = time_since_hidden - 4.0  # 0.0 to 1.0
-                        alpha = int(128 * (1.0 - fade_progress))
-                        alpha = max(0, min(128, alpha))  # Clamp between 0-128
+                        summary_lines.append(f"Downsampling: {avg_downsample_time:.1f}ms, Reduction Ratio: {reduction_ratio:.1f}x")
+                    if not debug_mode and depth > 0:
+                        summary_lines.append("\nGrid Layer Breakdown:")
+                        layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
+                        for layer in layer_info:
+                            summary_lines.append(f"  {layer}")
+                        summary_lines.append(f"  Total screens = {formatted_total}")
                     
-                    # Create a small overlay at the bottom of the screen
-                    min_height = 40
-                    min_info = pygame.Surface((screen.get_width(), min_height), pygame.SRCALPHA)
-                    min_info.fill((0, 0, 0, alpha))
+                    if enable_memory_tracing:
+                        snapshot = tracemalloc.take_snapshot()
+                        top_stats = snapshot.statistics('lineno')
+                        summary_lines.append("\nTop 5 Memory Allocations (Python-level):")
+                        for stat in top_stats[:5]:
+                            summary_lines.append(f"  {stat}")
                     
-                    # Make text opacity match the background
-                    text_color = (255, 255, 255, min(255, alpha * 2))  # Text stays more visible longer
-                    help_text = font.render("Press 's' to show info", True, text_color)
-                    min_info.blit(help_text, (10, 10))
+                    memory_usage = process.memory_info().rss / 1024 / 1024
+                    summary_lines.append(f"Current Process Memory Usage (Hardware-level): {memory_usage:.2f} MB")
+                    for line in summary_lines:
+                        logging.info(line)
+                frames_since_last_log = 0
+                successful_grids_since_last_log = 0
+                min_process_time = float('inf')
+                max_process_time = 0
+                total_process_time = 0
+                last_status_time = current_time
+            
+            clock.tick(30)
+
+        cap.release()
+        pygame.quit()
+        logging.info("Shutdown complete")
+    except Exception as e:
+        logging.error(f"Main function crashed: {e}\n{traceback.format_exc()}")
+    finally:
+        try:
+            if is_apple_silicon and hardware_acceleration_available:
+                stop_memory_cleanup_thread()
+                
+            if ci_context is not None:
+                try:
+                    ci_context.clearCaches()
+                except Exception as e:
+                    logging.error(f"Error clearing CI context cache during shutdown: {e}")
                     
-                    # Position at the bottom of the screen
-                    screen.blit(min_info, (0, screen.get_height() - min_height))
-
-            pygame.display.flip()
-        except Exception as e:
-            logging.error(f"Display error: {e}")
-            dropped_count += 1
-
-        # Periodic garbage collection and status logging
-        if current_time - last_gc_time > 10.0:
+            if cap is not None:
+                try:
+                    cap.release()
+                    logging.debug("Released video capture resources")
+                except Exception as e:
+                    logging.error(f"Error releasing video capture: {e}")
+            
+            for frame_var in ['frame', 'processed_frame']:
+                if frame_var in locals() and locals()[frame_var] is not None:
+                    try:
+                        del locals()[frame_var]
+                    except Exception as e:
+                        logging.error(f"Error cleaning up {frame_var}: {e}")
+            
+            for surface_var in ['frame_surface', 'screen']:
+                if surface_var in locals() and locals()[surface_var] is not None:
+                    try:
+                        locals()[surface_var] = None
+                    except Exception as e:
+                        logging.error(f"Error cleaning up {surface_var}: {e}")
+            
+            for font_var in ['font']:
+                if font_var in locals() and locals()[font_var] is not None:
+                    try:
+                        locals()[font_var] = None
+                    except Exception as e:
+                        logging.error(f"Error cleaning up {font_var}: {e}")
+            
+            try:
+                pygame.quit()
+                logging.debug("Pygame resources released")
+            except Exception as e:
+                logging.error(f"Error quitting Pygame: {e}")
+            
             gc.collect()
-            last_gc_time = current_time
             
-        # Summarized logging every 5 seconds
-        if current_time - last_status_time > 5.0:
-            if frames_since_last_log > 0:
-                avg_process_time = total_process_time / frames_since_last_log * 1000
-                
-                # Build a comprehensive summary
-                summary_lines = [
-                    f"===== PERFORMANCE SUMMARY =====",
-                    f"Configuration: Grid {grid_size}x{grid_size}, Depth {depth}, Mode: {'DEBUG' if debug_mode else 'GRID'}",
-                    f"Frames: Captured {frame_count}, Displayed {displayed_count}, Dropped {dropped_count}",
-                    f"Processing: Min {min_process_time * 1000:.1f}ms, Max {max_process_time * 1000:.1f}ms, Avg {avg_process_time:.1f}ms",
-                    f"Success Rate: {successful_grids_since_last_log}/{frames_since_last_log} frames processed successfully",
-                    f"FPS: {int(clock.get_fps())}"
-                ]
-                
-                # Add hardware acceleration status
-                hw_line = "Hardware Acceleration: "
-                if hardware_acceleration_available:
-                    hw_line += "Enabled"
-                    if force_hardware_acceleration:
-                        hw_line += " (Forced)"
-                else:
-                    hw_line += "Disabled"
-                    if allow_software_fallback:
-                        hw_line += " (Software Fallback)"
-                summary_lines.append(hw_line)
-                
-                # Add downsampling info if available
-                if downsample_times and downsample_sizes:
-                    avg_downsample_time = sum(downsample_times) / len(downsample_times) * 1000
-                    last_original, last_small = downsample_sizes[-1]
-                    reduction_ratio = last_original / max(1, last_small)
-                    summary_lines.append(f"Downsampling: {avg_downsample_time:.1f}ms, Reduction Ratio: {reduction_ratio:.1f}x")
-                
-                # Add grid layer breakdown
-                if not debug_mode and depth > 0:
-                    summary_lines.append("\nGrid Layer Breakdown:")
-                    layer_info, total_screens, formatted_total = get_grid_layer_breakdown(grid_size, depth)
-                    for layer in layer_info:
-                        summary_lines.append(f"  {layer}")
-                    summary_lines.append(f"  Total screens = {formatted_total}")
-                
-                # Log the summary
-                for line in summary_lines:
-                    logging.info(line)
-            
-            # Reset summary stats
-            frames_since_last_log = 0
-            successful_grids_since_last_log = 0
-            failed_grids_since_last_log = 0
-            min_process_time = float('inf')
-            max_process_time = 0
-            total_process_time = 0
-            last_status_time = current_time
-        
-        clock.tick(30)
-
-    cap.release()
-    pygame.quit()
-    logging.info("Shutdown complete")
+            logging.info("Shutdown complete")
+        except Exception as e:
+            logging.error(f"Error during cleanup: {e}\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logging.error(f"Main crashed: {e}\n{traceback.format_exc()}")
+        logging.error(f"Program crashed: {e}\n{traceback.format_exc()}")
