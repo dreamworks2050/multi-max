@@ -30,6 +30,7 @@ a = Analysis(
         ('PyObjCTools_copy', 'PyObjCTools'),
         ('psutil_copy', 'psutil'),
         ('memory_profiler_copy', '.'),
+        ('.env', '.'),  # Include the .env file in the root directory
     ],
     hiddenimports=[
         'numpy', 'numpy.core', 'numpy.core.multiarray', 'numpy.core.umath',
@@ -74,17 +75,17 @@ exe = EXE(
     entitlements_file=None,
 )
 
-# Uncomment the following to create a macOS app bundle
-# app = BUNDLE(
-#     exe,
-#     name='Multi-Max.app',
-#     icon=None,  # Add path to icon file here
-#     bundle_identifier='com.yourdomain.multi-max',
-#     info_plist={
-#         'CFBundleName': 'Multi-Max',
-#         'CFBundleDisplayName': 'Multi-Max',
-#         'CFBundleVersion': '1.0',
-#         'CFBundleShortVersionString': '1.0',
-#         'NSHighResolutionCapable': 'True',
-#     },
-# ) 
+# Create a macOS app bundle
+app = BUNDLE(
+    exe,
+    name='Multi-Max.app',
+    icon=None,  # Add path to icon file here
+    bundle_identifier='com.example.multi-max',
+    info_plist={
+        'CFBundleName': 'Multi-Max',
+        'CFBundleDisplayName': 'Multi-Max',
+        'CFBundleVersion': '1.0',
+        'CFBundleShortVersionString': '1.0',
+        'NSHighResolutionCapable': 'True',
+    },
+) 

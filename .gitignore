@@ -88,6 +88,8 @@ celerybeat-schedule
 
 # Environments
 .env
+.env_backup
+.env.*
 .venv
 env/
 venv/
@@ -165,8 +167,11 @@ pyinstaller_workdir/
 # Temporary test files
 simple_test.py
 test_*.py
+test_*.spec
+test_*.sh
 direct_test
 direct.spec
+/tmp/
 
 # Keep specific project files
 !main.spec
@@ -183,6 +188,11 @@ direct.spec
 *~
 *.bak
 *.swp
+*_backup
 
 # Generated documentation
 docs/generated/
+
+# Temporary directories
+/tmp_*
+/temp/

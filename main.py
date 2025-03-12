@@ -2014,13 +2014,32 @@ def main():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
+        # Try to load environment variables from .env file
         load_dotenv()
         
+        # Set default values for environment variables if not found in .env
         youtube_url = os.getenv('YOUTUBE_URL')
         if not youtube_url:
-            logging.error("No YouTube URL found in .env file. Please set YOUTUBE_URL in .env file.")
-            return
+            # Default YouTube URL if .env is missing or variable not set
+            youtube_url = "https://www.youtube.com/watch?v=ZzWBpGwKoaI"
+            logging.warning("No YOUTUBE_URL found in .env file. Using default demo URL.")
             
+            # Also set default values for other environment variables
+            if os.getenv('FORCE_HARDWARE_ACCELERATION') is None:
+                os.environ['FORCE_HARDWARE_ACCELERATION'] = 'true'
+                force_hardware_acceleration = True
+                logging.warning("No FORCE_HARDWARE_ACCELERATION found in .env file. Using default: true")
+                
+            if os.getenv('ALLOW_SOFTWARE_FALLBACK') is None:
+                os.environ['ALLOW_SOFTWARE_FALLBACK'] = 'false'
+                allow_software_fallback = False
+                logging.warning("No ALLOW_SOFTWARE_FALLBACK found in .env file. Using default: false")
+                
+            if os.getenv('ENABLE_MEMORY_TRACING') is None:
+                os.environ['ENABLE_MEMORY_TRACING'] = 'false'
+                enable_memory_tracing = False
+                logging.warning("No ENABLE_MEMORY_TRACING found in .env file. Using default: false")
+        
         parser = argparse.ArgumentParser(description='Recursive Video Grid')
         parser.add_argument('--grid-size', type=int, default=3,
                             help='Grid size (odd numbers needed for center position in fractal mode)')
@@ -2035,7 +2054,7 @@ def main():
         parser.add_argument('--mode', type=str, choices=['grid', 'fractal', 'fractal_depth'], default='fractal_depth')
         parser.add_argument('--fractal-source', type=int, choices=[1, 2, 3], default=2,
                             help='Position of source in fractal mode (1=top-left, 2=center with odd grids and 2x2 special case, 3=top-right)')
-        
+
         args = parser.parse_args()
         grid_size, depth = args.grid_size, args.depth
         mode = args.mode
