@@ -15,8 +15,11 @@ import pygame
 import Quartz
 import tracemalloc
 import psutil
+import queue
 from memory_profiler import profile
-from infinite_fractal import create_fractal_grid
+
+# Global variables section
+os.environ['OPENCV_FFMPEG_DEBUG'] = '0'  # Disable verbose FFmpeg output
 
 # Load environment variables
 load_dotenv()
@@ -28,7 +31,26 @@ def configure_logging(level_name):
     """Configure logging level based on input string."""
     try:
         level = getattr(logging, level_name.upper(), logging.INFO)
-        logging.getLogger().setLevel(level)
+        
+        class FFmpegFilter(logging.Filter):
+            def filter(self, record):
+                # Skip low-priority FFmpeg and OpenCV logs
+                message = record.getMessage().lower()
+                if record.levelno >= logging.WARNING:
+                    return True
+                if any(term in message for term in [
+                    '[opencv', '[ffmpeg', 'opening', 'skip', 
+                    'hls request', 'videoplayback', 'manifest.googlevideo',
+                    'cannot reuse http connection'  # Added term
+                ]):
+                    return False
+                return True
+        
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+        for handler in root_logger.handlers:
+            handler.addFilter(FFmpegFilter())
+        logging.debug("Logging configured with level %s and FFmpeg/OpenCV filter", level_name.upper())
     except AttributeError as e:
         logging.error(f"Invalid log level '{level_name}': {e}")
         logging.getLogger().setLevel(logging.INFO)
@@ -49,7 +71,6 @@ context_options = {}
 # Global variables for memory management
 cleanup_thread_running = False
 memory_cleanup_thread = None
-# Add cleanup stats tracking
 cleanup_stats = {
     'total_cleanups': 0,
     'extra_cleanups': 0,
@@ -62,9 +83,460 @@ cleanup_stats = {
 # Global variables to track key state and press duration
 key_pressed = {}
 key_press_start = {}
-key_repeat_delay = 0.2  # Initial delay before repeat starts (in seconds) - make this shorter
-key_repeat_interval = 0.03  # Interval between repeats once started (in seconds) - make this faster
-key_last_repeat = {}  # Track when the key was last repeated
+key_repeat_delay = 0.2  # Initial delay before repeat starts
+key_repeat_interval = 0.03  # Interval between repeats
+key_last_repeat = {}
+
+# Setup for FFmpeg error detection without verbose logging
+# Instead of setting OPENCV_FFMPEG_DEBUG=1 which produces too much output,
+# we'll create a custom FFmpeg error detection system
+os.environ['OPENCV_FFMPEG_DEBUG'] = '0'  # Disable verbose FFmpeg output
+ffmpeg_http_errors = []  # Store detected HTTP errors to check periodically
+youtube_connection_status = {
+    'last_success': 0,
+    'last_error': 0,
+    'error_count': 0,
+    'retry_count': 0,
+    'current_host': ''
+}
+
+def log_youtube_connection_status(status, host='', error=''):
+    """
+    Log YouTube connection status without verbose details.
+    Only logs important connection events rather than every FFmpeg operation.
+    
+    Args:
+        status: Connection status string ('connected', 'error', 'retry', etc.)
+        host: Optional host information 
+        error: Optional error details
+    """
+    global youtube_connection_status
+    current_time = time.time()
+    
+    if status == 'connected':
+        # Only log new connections or reconnections after errors
+        if youtube_connection_status['last_success'] == 0 or youtube_connection_status['error_count'] > 0:
+            if host and host != youtube_connection_status['current_host']:
+                logging.info(f"Connected to YouTube server: {host}")
+                youtube_connection_status['current_host'] = host
+            else:
+                logging.info("Connected to YouTube stream successfully")
+            youtube_connection_status['error_count'] = 0
+            youtube_connection_status['retry_count'] = 0
+        youtube_connection_status['last_success'] = current_time
+    
+    elif status == 'error':
+        youtube_connection_status['last_error'] = current_time
+        youtube_connection_status['error_count'] += 1
+        # Only log the first few errors to avoid spamming the log
+        if youtube_connection_status['error_count'] <= 3 and error:
+            logging.warning(f"YouTube connection error: {error}")
+        elif youtube_connection_status['error_count'] == 4:
+            logging.warning("Multiple YouTube connection errors - suppressing further error messages")
+    
+    elif status == 'retry':
+        youtube_connection_status['retry_count'] += 1
+        # Only log occasional retries to avoid log spam
+        if youtube_connection_status['retry_count'] % 5 == 1:
+            logging.info(f"Retrying YouTube connection (attempt {youtube_connection_status['retry_count']})")
+
+# Frame buffer for continuous streaming
+frame_buffer = None
+frame_buffer_lock = None
+frame_reader_thread = None
+frame_buffer_size = 60  # Increase buffer size further to 60
+should_stop_frame_reader = False
+current_stream_url = None  # Store the stream URL globally
+last_buffer_warning_time = 0  # Track when we last issued a warning
+frame_drop_threshold = 0.8  # Drop frames if buffer is more than 80% full
+stream_url_refresh_interval = 5 * 60  # Refresh YouTube URL every 5 minutes (reduced from 15)
+last_url_refresh_time = 0  # Last time the URL was refreshed
+
+def refresh_youtube_url(original_url):
+    """Get a fresh streaming URL from YouTube to handle shifting servers."""
+    try:
+        logging.info(f"Refreshing YouTube stream URL for: {original_url}")
+        # Force a clearing of any cached data by using a timestamp parameter
+        ts = int(time.time())
+        query_url = f"{original_url}{'&' if '?' in original_url else '?'}_ts={ts}"
+        
+        # Use a more aggressive approach to get a fresh URL from YouTube
+        new_url = get_stream_url(query_url)
+        
+        if new_url:
+            logging.info("Successfully obtained fresh YouTube stream URL")
+            return new_url
+        else:
+            logging.warning("Failed to get a fresh URL, will retry later")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to refresh YouTube URL: {e}")
+        return None
+
+def start_frame_reader_thread(video_source, stream_url, original_youtube_url, buffer_size=60):
+    """
+    Start a background thread to continuously read frames from the video source.
+    
+    Args:
+        video_source: OpenCV VideoCapture object
+        stream_url: URL of the video stream for reconnection
+        original_youtube_url: Original YouTube URL for periodic refresh
+        buffer_size: Maximum number of frames to keep in the buffer
+    """
+    global frame_buffer, frame_buffer_lock, frame_reader_thread, should_stop_frame_reader
+    global current_stream_url, frame_drop_threshold, last_url_refresh_time
+    
+    # Store the stream URL globally
+    current_stream_url = stream_url
+    last_url_refresh_time = time.time()
+    
+    frame_buffer = queue.Queue(maxsize=buffer_size)
+    frame_buffer_lock = threading.Lock()
+    should_stop_frame_reader = False
+    
+    def frame_reader_worker():
+        """Worker thread that continuously reads frames from the video source."""
+        global current_stream_url, last_url_refresh_time
+        
+        logging.info("Frame reader thread started")
+        frames_read = 0
+        frames_dropped = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        target_fps = 30
+        frame_interval = 1.0 / target_fps
+        last_frame_time = time.time()
+        reconnection_backoff = 1.0  # Start with 1 second, will increase with failures
+        max_reconnection_backoff = 15.0  # Maximum backoff time in seconds
+        
+        # Create a dedicated VideoCapture instance for this thread
+        # to avoid thread safety issues with FFmpeg
+        width = int(video_source.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(video_source.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Create a thread-local VideoCapture instance
+        thread_cap = None
+        last_reconnect_attempt = 0
+        reconnect_interval = 3
+        
+        # Track HTTP connection errors to detect YouTube CDN shifts
+        http_errors_count = 0
+        http_error_threshold = 3  # Refresh URL after this many HTTP errors
+        last_error_time = 0
+        error_reset_interval = 60  # Reset error count after 60 seconds without errors
+        
+        def open_capture(url=None):
+            """
+            Open the video capture with the given URL or current_stream_url.
+            Handles different types of connection failures.
+            """
+            nonlocal thread_cap, consecutive_failures, reconnection_backoff, last_reconnect_attempt
+            
+            # Use provided URL or global one
+            capture_url = url if url is not None else current_stream_url
+            
+            if thread_cap is not None:
+                thread_cap.release()
+                # Longer delay after releasing to ensure complete connection cleanup
+                time.sleep(0.5)
+                thread_cap = None
+                
+            if isinstance(capture_url, str) and capture_url:
+                logging.info(f"Frame reader opening stream (backoff: {reconnection_backoff:.1f}s)")
+                
+                # Create dict of advanced FFmpeg options to disable connection reuse
+                # This addresses the "Cannot reuse HTTP connection for different host" error
+                ffmpeg_options = {
+                    "rtsp_transport": "tcp",                   # Use TCP for RTSP
+                    "fflags": "nobuffer",                      # Reduce latency
+                    "flags": "low_delay",                      # Prioritize low delay
+                    "stimeout": "5000000",                     # 5 second timeout in microseconds
+                    "reconnect": "1",                          # Enable reconnection
+                    "reconnect_streamed": "1",                 # Reconnect if stream fails
+                    "reconnect_delay_max": "5",                # Max 5 second reconnect delay
+                    "multiple_requests": "0",                  # Disable connection reuse - fixes the YouTube server issue
+                    "reuse_socket": "0",                       # Don't reuse sockets
+                    "http_persistent": "0",                    # Disable persistent HTTP connections
+                }
+                
+                # Convert dict to FFmpeg options string for OpenCV
+                ffmpeg_opt_str = ' '.join([f"-{k} {v}" for k, v in ffmpeg_options.items()])
+                
+                # Apply options via environment variable which OpenCV/FFmpeg will use
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = ffmpeg_opt_str
+                
+                # Create VideoCapture with options
+                thread_cap = cv2.VideoCapture(capture_url, cv2.CAP_FFMPEG)
+                
+                # Try setting various options to improve HTTP streaming reliability
+                options = [
+                    (cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000),  # 5 second timeout
+                    (cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000),   # 5 second read timeout
+                    (cv2.CAP_PROP_BUFFERSIZE, 3),             # Internal buffer size
+                ]
+                
+                if thread_cap.isOpened():
+                    # Set capture properties
+                    thread_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    thread_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    
+                    # Apply all options
+                    for option, value in options:
+                        try:
+                            thread_cap.set(option, value)
+                        except:
+                            pass
+                            
+                    # Try setting frame rate - not all cameras/drivers support this
+                    try:
+                        thread_cap.set(cv2.CAP_PROP_FPS, target_fps)
+                    except:
+                        pass
+                        
+                    consecutive_failures = 0
+                    reconnection_backoff = 1.0  # Reset backoff on success
+                    last_reconnect_attempt = time.time()
+                    
+                    # Extract hostname from URL for better logging
+                    host = "unknown"
+                    if capture_url and isinstance(capture_url, str):
+                        try:
+                            from urllib.parse import urlparse
+                            parsed_url = urlparse(capture_url)
+                            host = parsed_url.netloc
+                        except:
+                            pass
+                    
+                    # Use our custom logger with reduced verbosity
+                    log_youtube_connection_status('connected', host=host)
+                    return True
+                else:
+                    # Use our custom logger with reduced verbosity
+                    log_youtube_connection_status('error', error="Failed to open video capture")
+                    logging.error("Failed to open video capture in frame reader thread")
+            
+            reconnection_backoff = min(reconnection_backoff * 1.5, max_reconnection_backoff)
+            return False
+            
+        # Initialize the capture
+        if not open_capture():
+            logging.error("Frame reader could not open video source")
+        
+        # Track if we've filled the buffer at least once
+        buffer_filled = False
+        
+        while not should_stop_frame_reader:
+            current_time = time.time()
+            
+            # Reset HTTP error count if no errors for a while
+            if http_errors_count > 0 and current_time - last_error_time > error_reset_interval:
+                http_errors_count = 0
+                logging.debug("HTTP error count reset after error-free period")
+            
+            # Check if we need to refresh the YouTube URL periodically or after HTTP errors
+            need_refresh = False
+            if original_youtube_url:
+                # Regular time-based refresh
+                if current_time - last_url_refresh_time > stream_url_refresh_interval:
+                    need_refresh = True
+                    logging.debug(f"Scheduled URL refresh after {stream_url_refresh_interval/60:.1f} minutes")
+                # Error-triggered refresh
+                elif http_errors_count >= http_error_threshold:
+                    need_refresh = True
+                    http_errors_count = 0
+                    logging.debug(f"Forcing URL refresh after {http_error_threshold} connection errors")
+                
+                if need_refresh:
+                    new_url = refresh_youtube_url(original_youtube_url)
+                    if new_url and new_url != current_stream_url:
+                        logging.debug("Stream URL refreshed successfully")
+                        current_stream_url = new_url
+                        # Force reconnection with new URL
+                        if open_capture(new_url):
+                            logging.debug("Reconnected with fresh YouTube URL")
+                    last_url_refresh_time = current_time
+            
+            # Check if capture is valid
+            if thread_cap is None or not thread_cap.isOpened():
+                if current_time - last_reconnect_attempt > reconnection_backoff:
+                    log_youtube_connection_status('retry')
+                    logging.debug(f"Video source disconnected, reconnecting (backoff: {reconnection_backoff:.1f}s)...")
+                    open_capture()
+                    last_reconnect_attempt = current_time
+                time.sleep(0.5)
+                continue
+            
+            # Rate control - don't read frames faster than target FPS if buffer is getting full
+            elapsed = current_time - last_frame_time
+            buffer_fullness = frame_buffer.qsize() / buffer_size
+            
+            # If buffer is getting full, slow down frame reading
+            if buffer_fullness > frame_drop_threshold and elapsed < frame_interval:
+                # Buffer is filling up, sleep to maintain target frame rate
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            
+            # Read frame from our thread-local capture
+            try:
+                ret, frame = thread_cap.read()
+                last_frame_time = time.time()  # Update frame time after read
+            except Exception as e:
+                # Use our custom logger instead of verbose error messages
+                error_str = str(e).lower()
+                if "http" in error_str or "connect" in error_str or "host" in error_str or "network" in error_str:
+                    log_youtube_connection_status('error', error="HTTP connection error")
+                    http_errors_count += 1
+                    last_error_time = current_time
+                else:
+                    log_youtube_connection_status('error', error=f"Read error: {type(e).__name__}")
+                    
+                ret, frame = False, None
+                # Force reconnection on exception
+                consecutive_failures = max_consecutive_failures
+            
+            if not ret or frame is None:
+                consecutive_failures += 1
+                
+                # Alternative HTTP error detection without using FFmpeg debug output
+                # We'll rely on the pattern of consecutive failures and refresh URL more frequently when failures occur
+                if consecutive_failures >= 2:
+                    # Multiple consecutive failures often indicate connection issues with YouTube servers
+                    current_time = time.time()
+                    # Consider this likely to be an HTTP error after multiple consecutive failures
+                    if current_time - last_error_time > 5:  # Avoid counting the same error burst multiple times
+                        http_errors_count += 1
+                        last_error_time = current_time
+                        log_youtube_connection_status('error', error="Connection interrupted")
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    log_youtube_connection_status('retry')
+                    logging.warning(f"Failed to read frames from video source ({consecutive_failures} consecutive failures)")
+                    consecutive_failures = 0
+                    # Try to reopen the capture if we're consistently failing
+                    if current_time - last_reconnect_attempt > reconnect_interval:
+                        logging.warning("Too many consecutive failures, attempting to reconnect...")
+                        # Force a URL refresh more aggressively when consecutive failures occur
+                        if original_youtube_url and current_time - last_url_refresh_time > 60:  # Only wait 1 minute if failing
+                            new_url = refresh_youtube_url(original_youtube_url)
+                            if new_url:
+                                current_stream_url = new_url
+                                logging.debug("Refreshed URL due to consecutive failures")
+                                open_capture(new_url)
+                                last_url_refresh_time = current_time
+                            else:
+                                open_capture()
+                        else:
+                            open_capture()
+                time.sleep(min(0.1, reconnection_backoff / 2))  # Adaptive sleep on failure
+                continue
+            
+            consecutive_failures = 0
+            frames_read += 1
+            
+            try:
+                # If buffer is extremely full, skip this frame
+                buffer_fullness = frame_buffer.qsize() / buffer_size
+                if buffer_fullness > 0.95:  # > 95% full
+                    frames_dropped += 1
+                    continue
+                
+                # If buffer is full, remove the oldest frame
+                if frame_buffer.full():
+                    with frame_buffer_lock:
+                        try:
+                            # Non-blocking, just discard if full
+                            frame_buffer.get_nowait()
+                            frames_dropped += 1
+                        except queue.Empty:
+                            pass
+                
+                # Add the new frame to the buffer
+                with frame_buffer_lock:
+                    frame_buffer.put(frame.copy(), block=False)
+                    
+                    # Log when buffer is filled for the first time
+                    current_size = frame_buffer.qsize()
+                    if not buffer_filled and current_size >= buffer_size * 0.5:  # 50% full
+                        buffer_filled = True
+                        logging.info(f"Frame buffer filled to {current_size}/{buffer_size} frames")
+                    
+                # Log status periodically
+                if frames_read % 300 == 0:  # Log every ~10 seconds at 30fps
+                    logging.info(f"Frame reader stats: Read {frames_read}, Dropped {frames_dropped}, Buffer size {frame_buffer.qsize()}/{buffer_size}")
+                    
+            except queue.Full:
+                frames_dropped += 1
+                continue
+            except Exception as e:
+                logging.error(f"Error in frame reader thread: {e}")
+                continue
+                
+            # Adaptive sleep based on buffer fullness
+            if buffer_fullness < 0.2:  # Buffer is nearly empty
+                # Don't sleep, read as fast as possible to fill buffer
+                pass
+            elif buffer_fullness < 0.5:  # Buffer is somewhat empty
+                time.sleep(0.001)  # Very short sleep
+            else:  # Buffer is at least half full
+                time.sleep(0.005)  # Longer sleep to match consumption rate
+        
+        # Clean up resources
+        if thread_cap is not None:
+            thread_cap.release()
+            
+        logging.info(f"Frame reader thread stopped. Total frames read: {frames_read}, dropped: {frames_dropped}")
+    
+    frame_reader_thread = threading.Thread(target=frame_reader_worker, 
+                                          name="FrameReader", 
+                                          daemon=True)
+    frame_reader_thread.start()
+    return frame_reader_thread
+
+def get_latest_frame():
+    """
+    Get the latest frame from the buffer.
+    
+    Returns:
+        np.ndarray: The next frame from the buffer, or None if no frames are available
+    """
+    global frame_buffer, frame_buffer_lock, last_buffer_warning_time
+    
+    if frame_buffer is None or frame_buffer.empty():
+        # Limit warning frequency to once per second
+        current_time = time.time()
+        if current_time - last_buffer_warning_time > 1.0:
+            logging.warning("No frames available from buffer")
+            last_buffer_warning_time = current_time
+        return None
+        
+    with frame_buffer_lock:
+        # IMPORTANT FIX: Don't clear the buffer, just get the next frame
+        # This was the main issue causing stuttering - we were emptying the entire buffer every time
+        try:
+            frame = frame_buffer.get_nowait()
+            return frame
+        except queue.Empty:
+            return None
+
+def stop_frame_reader_thread():
+    """Stop the frame reader thread."""
+    global should_stop_frame_reader, frame_reader_thread, frame_buffer
+    
+    if frame_reader_thread is not None and frame_reader_thread.is_alive():
+        should_stop_frame_reader = True
+        frame_reader_thread.join(timeout=2.0)
+        if frame_reader_thread.is_alive():
+            logging.warning("Frame reader thread did not terminate gracefully")
+            
+    # Clear the frame buffer
+    if frame_buffer is not None:
+        with frame_buffer_lock:
+            while not frame_buffer.empty():
+                try:
+                    frame_buffer.get_nowait()
+                except queue.Empty:
+                    break
 
 if is_apple_silicon:
     try:
@@ -151,11 +623,12 @@ running = True
 debug_mode = False
 show_info = True
 info_hidden_time = 0
-mode = "fractal"  # Default mode is fractal
-fractal_grid_size = 3  # Starting grid size for fractal mode (odd number for center position)
+mode = "fractal_depth"  # Default mode is fractal_depth
+fractal_grid_size = 3  # Starting grid size for fractal mode
 fractal_debug = False  # Debug toggle for fractal mode
-fractal_source_position = 2  # Position of source in fractal mode (1=top-left, 2=center, 3=top-right)
+fractal_source_position = 2  # Position of source in fractal mode
 prev_output_frame = None
+fractal_depth = 1  # Depth for fractal_depth mode, starting at 1
 
 # Stats
 frame_count = 0
@@ -176,10 +649,118 @@ def conditional_profile(func):
     decorator = profile if enable_memory_tracing else dummy_decorator
     return decorator(func)
 
-def handle_keyboard_event(key_name):
-    """Handle keyboard inputs for adjusting grid settings and mode switching."""
-    global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug, fractal_source_position, cap
+def create_fractal_grid(live_frame, prev_output, grid_size, source_position=1):
+    """
+    Create an NxN grid for the infinite fractal effect:
+    - Source position 1: Live frame in top-left cell (default)
+    - Source position 2: Live frame in center cell (or nearest to center)
+    - Source position 3: Live frame in top-right cell
     
+    Args:
+        live_frame (np.ndarray): The current frame from the video stream.
+        prev_output (np.ndarray): The previous output frame of the grid (for recursion).
+        grid_size (int): Size of the grid (e.g., 2 for 2x2, 3 for 3x3, etc.).
+        source_position (int): Position of the source frame (1=top-left, 2=center, 3=top-right)
+    
+    Returns:
+        np.ndarray: The resulting NxN grid frame.
+    """
+    if prev_output is None:
+        prev_output = np.zeros_like(live_frame)
+    
+    h, w = live_frame.shape[:2]
+    cell_h = h // grid_size
+    cell_w = w // grid_size
+    
+    # Create output array - reuse memory allocation when possible by using zeros_like
+    grid_frame = np.zeros_like(live_frame)
+    
+    # Determine the position of the source frame based on source_position
+    source_i, source_j = 0, 0  # Default: top-left (position 1)
+    
+    if source_position == 2:  # Center
+        if grid_size == 2:
+            source_i = 0
+            source_j = 1  # top-right in a 2x2 grid
+        elif grid_size % 2 == 1:
+            source_i = source_j = grid_size // 2
+        else:
+            center = grid_size / 2 - 0.5
+            source_i = int(center)
+            source_j = int(center)
+    elif source_position == 3:  # Top-right
+        source_i = 0
+        source_j = grid_size - 1
+    
+    # Buffer for resized cells to avoid redundant memory allocations
+    resized_source = None
+    resized_prev = None
+    
+    try:
+        for i in range(grid_size):
+            for j in range(grid_size):
+                y_start = i * cell_h
+                y_end = (i + 1) * cell_h if i < grid_size - 1 else h
+                x_start = j * cell_w
+                x_end = (j + 1) * cell_w if j < grid_size - 1 else w
+                
+                cell_width = x_end - x_start
+                cell_height = y_end - y_start
+                
+                if i == source_i and j == source_j:
+                    # Source cell: Live frame
+                    # Reuse buffer if dimensions match
+                    if resized_source is None or resized_source.shape[:2] != (cell_height, cell_width):
+                        resized_source = np.empty((cell_height, cell_width, 3), dtype=np.uint8)
+                    cv2.resize(live_frame, (cell_width, cell_height), dst=resized_source)
+                    
+                    # Copy to output
+                    grid_frame[y_start:y_end, x_start:x_end] = resized_source
+                else:
+                    # Other cells: Previous output
+                    # Reuse buffer if dimensions match
+                    if resized_prev is None or resized_prev.shape[:2] != (cell_height, cell_width):
+                        resized_prev = np.empty((cell_height, cell_width, 3), dtype=np.uint8)
+                    cv2.resize(prev_output, (cell_width, cell_height), dst=resized_prev)
+                    
+                    # Copy to output
+                    grid_frame[y_start:y_end, x_start:x_end] = resized_prev
+        
+        return grid_frame
+    except Exception as e:
+        logging.error(f"Error in create_fractal_grid: {e}")
+        return live_frame.copy()  # Fallback to original frame on error
+    finally:
+        # Clean up temporary buffers
+        if resized_source is not None:
+            del resized_source
+        if resized_prev is not None:
+            del resized_prev
+
+def compute_fractal_depth(live_frame, depth):
+    """
+    Compute the fractal output for a given depth in fractal_depth mode.
+    - Depth 0: Returns a black image (base case).
+    - Depth d: Creates a 2x2 grid with live_frame in top-right and the previous depth's output in other cells.
+    
+    Args:
+        live_frame (np.ndarray): The current frame from the video stream.
+        depth (int): The number of fractal depth levels to apply.
+    
+    Returns:
+        np.ndarray: The resulting frame after applying the specified depth.
+    """
+    if depth == 0:
+        return np.zeros_like(live_frame)
+    else:
+        prev = compute_fractal_depth(live_frame, depth - 1)
+        return create_fractal_grid(live_frame, prev, 2, 3)
+
+def handle_keyboard_event(key_name, mod=None):
+    """Handle keyboard inputs for adjusting grid settings and mode switching."""
+    global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug
+    global fractal_source_position, cap, fractal_depth, prev_frames
+
     old_grid_size = grid_size
     old_depth = depth
     old_debug_mode = debug_mode
@@ -187,147 +768,152 @@ def handle_keyboard_event(key_name):
     old_fractal_source_position = fractal_source_position
     
     try:
-        # Track if this is a held key (for logging purposes)
         is_repeat = key_name in ['up', 'down'] and key_pressed.get(key_name, False) and time.time() - key_press_start.get(key_name, 0) > key_repeat_delay
         
-        if key_name == 'up':
+        if key_name == '4' and (not mod or not (mod & pygame.KMOD_SHIFT)) and mode == "fractal":
+            mode = "fractal_depth"
+            fractal_depth = 1
+            logging.info("Mode changed to: fractal_depth (Mode [4])")
+            depth_info = get_fractal_depth_breakdown(fractal_depth)
+            for info in depth_info:
+                logging.info(f"  {info}")
+            logging.info("Use UP/DOWN arrow keys to increase/decrease depth level (1-100)")
+        
+        elif mode == "fractal_depth" and key_name == 'up':
+            old_fractal_depth = fractal_depth
+            fractal_depth = min(100, fractal_depth + 1)
+            if old_fractal_depth != fractal_depth:
+                # Extend prev_frames if needed
+                if len(prev_frames) < fractal_depth:
+                    prev_frames.extend([None] * (fractal_depth - len(prev_frames)))
+                
+                depth_info = get_fractal_depth_breakdown(fractal_depth)
+                logging.info(f"Fractal depth set to {fractal_depth}")
+                for info in depth_info:
+                    logging.info(f"  {info}")
+        
+        elif mode == "fractal_depth" and key_name == 'down':
+            old_fractal_depth = fractal_depth
+            fractal_depth = max(1, fractal_depth - 1)
+            if old_fractal_depth != fractal_depth:
+                # Clean up unused frames when depth decreases
+                if old_fractal_depth > fractal_depth:
+                    # Set unused frames to None to help with garbage collection
+                    for i in range(fractal_depth, len(prev_frames)):
+                        prev_frames[i] = None
+                    # Truncate the list to match the new depth
+                    prev_frames[fractal_depth:] = []
+                    gc.collect()
+                
+                depth_info = get_fractal_depth_breakdown(fractal_depth)
+                logging.info(f"Fractal depth set to {fractal_depth}")
+                for info in depth_info:
+                    logging.info(f"  {info}")
+        
+        elif key_name == 'f':
+            if mode == "grid":
+                mode = "fractal"
+            elif mode == "fractal":
+                mode = "fractal_depth"
+            else:
+                mode = "grid"
+            logging.info(f"Mode changed to: {mode}")
+        
+        elif key_name == 'up':
             if mode == "fractal":
-                # For position 2 (center), ensure we only use odd-numbered grid sizes
                 if fractal_source_position == 2:
-                    # Special case: going from 2x2 to 3x3
                     if fractal_grid_size == 2:
                         fractal_grid_size = 3
                         logging.info(f"Grid size changed to 3x3 (with center source position)")
-                    # If current is even, move to next odd
                     elif fractal_grid_size % 2 == 0:
                         fractal_grid_size += 1
                     else:
-                        fractal_grid_size += 2  # Jump to next odd number
+                        fractal_grid_size += 2
                 else:
                     fractal_grid_size += 1
                 
-                # Use default dimensions for calculations
                 frame_width, frame_height = 1280, 720
-                
                 visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
                 visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
                 
-                # Format resolution limiting text
                 resolution_text = ""
                 if is_resolution_limited:
                     smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
                     resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
                 
-                # Only log changes if not a key repeat, or if it's a significant change
                 if not is_repeat or fractal_grid_size % 5 == 0:
                     logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
                     logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
-            else:
+            elif mode == "grid":
                 grid_size += 1
                 if not is_repeat or grid_size % 5 == 0:
                     logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+        
         elif key_name == 'down':
             if mode == "fractal":
-                # For position 2 (center), ensure we only use odd-numbered grid sizes
-                # with special exception for 2x2 grid
                 if fractal_source_position == 2:
-                    # Special case: going from 3x3 to 2x2
                     if fractal_grid_size == 3:
                         fractal_grid_size = 2
                         logging.info(f"Grid size changed to 2x2 (with top-right source position)")
-                    # Ensure we never go below 2 in position 2
                     elif fractal_grid_size <= 2:
                         fractal_grid_size = 2
                     else:
-                        # If current is even, move to previous odd
                         if fractal_grid_size % 2 == 0:
                             fractal_grid_size -= 1
                         else:
-                            fractal_grid_size -= 2  # Jump to previous odd number
+                            fractal_grid_size -= 2
                 else:
                     fractal_grid_size = max(1, fractal_grid_size - 1)
                 
-                # Use default dimensions for calculations
                 frame_width, frame_height = 1280, 720
-                
                 visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
                 visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
                 
-                # Format resolution limiting text
                 resolution_text = ""
                 if is_resolution_limited:
                     smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
                     resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
                 
-                # Only log changes if not a key repeat, or if it's a significant change
                 if not is_repeat or fractal_grid_size % 5 == 0:
                     logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
                     logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
-            else:
+            elif mode == "grid":
                 grid_size = max(1, grid_size - 1)
                 if not is_repeat or grid_size % 5 == 0:
                     logging.info(f"Grid size changed: {old_grid_size}x{old_grid_size} → {grid_size}x{grid_size}")
+        
         elif key_name in '1234567890':
             if mode == "grid":
-                # In grid mode, number keys change the recursion depth
                 old_depth = depth
                 depth = int(key_name) if key_name != '0' else 10
                 logging.info(f"Recursion depth changed: {old_depth} → {depth}")
-            else:
-                # In fractal mode, handle only keys 1-3 for source position
-                if key_name in '123':
-                    old_pos = fractal_source_position
-                    fractal_source_position = int(key_name)
-                    
-                    # When switching to position 2 (center), ensure we use an odd-sized grid (except for 2x2)
-                    if fractal_source_position == 2 and fractal_grid_size % 2 == 0 and fractal_grid_size != 2:
-                        # Adjust to next odd number
-                        fractal_grid_size += 1
-                        logging.info(f"Adjusted grid size to {fractal_grid_size} for center positioning")
-                    
-                    position_desc = {
-                        1: "top-left",
-                        2: "center",
-                        3: "top-right"
-                    }
-                    
-                    # Provide more specific message for the 2x2 special case
-                    if fractal_source_position == 2 and fractal_grid_size == 2:
-                        logging.info(f"Fractal source position changed: {position_desc[old_pos]} → top-right (special 2x2 case)")
-                    else:
-                        logging.info(f"Fractal source position changed: {position_desc[old_pos]} → {position_desc[fractal_source_position]}")
+            elif mode == "fractal" and key_name in '123':
+                old_pos = fractal_source_position
+                fractal_source_position = int(key_name)
+                
+                if fractal_source_position == 2 and fractal_grid_size % 2 == 0 and fractal_grid_size != 2:
+                    fractal_grid_size += 1
+                    logging.info(f"Adjusted grid size to {fractal_grid_size} for center positioning")
+                
+                position_desc = {1: "top-left", 2: "center", 3: "top-right"}
+                if fractal_source_position == 2 and fractal_grid_size == 2:
+                    logging.info(f"Fractal source position changed: {position_desc[old_pos]} → top-right (special 2x2 case)")
+                else:
+                    logging.info(f"Fractal source position changed: {position_desc[old_pos]} → {position_desc[fractal_source_position]}")
+        
         elif key_name == 'd':
-            if mode == "fractal":
+            if mode == "fractal" or mode == "fractal_depth":
                 fractal_debug = not fractal_debug
                 logging.info(f"Fractal debug mode: {'enabled' if fractal_debug else 'disabled'}")
             else:
                 debug_mode = not debug_mode
                 logging.info(f"Debug mode: {'enabled' if debug_mode else 'disabled'}")
+        
         elif key_name == 's':
             show_info = not show_info
             logging.info(f"Info overlay: {'shown' if show_info else 'hidden'}")
             if not show_info:
                 info_hidden_time = time.time()
-        elif key_name == 'f':
-            mode = "fractal" if mode != "fractal" else "grid"
-            logging.info(f"Mode changed to: {mode}")
-            
-            # If switching to fractal mode, log detailed fractal information
-            if mode == "fractal":
-                # Use default dimensions for calculations
-                frame_width, frame_height = 1280, 720
-                
-                visible_screens, is_resolution_limited, max_level, screens_by_category = calculate_visible_screens(fractal_grid_size, frame_width, frame_height)
-                visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
-                
-                # Format resolution limiting text
-                resolution_text = ""
-                if is_resolution_limited:
-                    smallest_pixel_size = min(frame_width, frame_height) / (fractal_grid_size ** max_level)
-                    resolution_text = f" (at {frame_width}x{frame_height} resolution, limited by {smallest_pixel_size:.2f} pixels per cell)"
-                
-                logging.info(f"Fractal grid size: {fractal_grid_size}x{fractal_grid_size}")
-                logging.info(f"Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
         
         if mode == "grid" and (old_grid_size != grid_size or old_depth != depth):
             frame_h, frame_w = 720, 1280
@@ -615,6 +1201,83 @@ def fill_black_pixels(result, grid_size):
     except Exception as e:
         logging.error(f"Error in fill_black_pixels: {e}\n{traceback.format_exc()}")
 
+def hardware_process_grid_cells(small_frame, previous_frame, grid_size):
+    """Process grid cells after hardware downsampling."""
+    global mode
+    
+    h, w = previous_frame.shape[:2]
+    base_cell_h = h // grid_size
+    base_cell_w = w // grid_size
+    remainder_h = h % grid_size
+    remainder_w = w % grid_size
+    
+    result = np.empty((h, w, 3), dtype=np.uint8)
+    
+    small_h, small_w = small_frame.shape[:2]
+    if small_h <= 0 or small_w <= 0:
+        logging.error(f"Invalid downsampled frame dimensions: {small_w}x{small_h}")
+        return None
+    
+    frame_aspect = 16 / 9
+    cell_count = 0
+    total_cells = grid_size * grid_size
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            cell_count += 1
+            
+            cell_h = base_cell_h + (1 if i < remainder_h else 0)
+            cell_w = base_cell_w + (1 if j < remainder_w else 0)
+            y_start = sum([base_cell_h + (1 if k < remainder_h else 0) for k in range(i)])
+            y_end = y_start + cell_h
+            x_start = sum([base_cell_w + (1 if k < remainder_w else 0) for k in range(j)])
+            x_end = x_start + cell_w
+            y_end = min(y_end, h)
+            x_end = min(x_end, w)
+            cell_h = y_end - y_start
+            cell_w = x_end - x_start
+            
+            if cell_h < 1 or cell_w < 1:
+                logging.warning(f"Cell too small: {cell_w}x{cell_h}, using average color")
+                avg_color = np.mean(small_frame, axis=(0, 1)).astype(np.uint8)
+                result[y_start:y_end, x_start:x_end] = avg_color
+                continue
+                
+            try:
+                if frame_aspect > cell_w / cell_h:
+                    required_width = int(small_h * (cell_w / cell_h))
+                    crop_x = int((small_w - required_width) / 2)
+                    crop_x = max(0, crop_x)
+                    crop_w = min(required_width, small_w - crop_x)
+                    cropped = small_frame[:, crop_x:crop_x + crop_w] if crop_x + crop_w <= small_w else small_frame[:, :small_w]
+                else:
+                    required_height = int(small_w * (cell_h / cell_w))
+                    crop_y = int((small_h - required_height) / 2)
+                    crop_y = max(0, crop_y)
+                    crop_h = min(required_height, small_h - crop_y)
+                    cropped = small_frame[crop_y:crop_y + crop_h, :] if crop_y + crop_h <= small_h else small_frame[:small_h, :]
+                    
+                interpolation = cv2.INTER_LINEAR if (cropped.shape[0] < cell_h or cropped.shape[1] < cell_w) else cv2.INTER_AREA
+                result[y_start:y_end, x_start:x_end] = cv2.resize(cropped, (cell_w, cell_h), interpolation=interpolation)
+                
+            except Exception as e:
+                if mode == "grid":
+                    logging.error(f"Error processing cell {i}x{j}: {e}")
+                else:
+                    logging.error(f"Error processing cell {i}x{j}: {e}")
+                result[y_start:y_end, x_start:x_end] = 0
+            
+            gc_frequency = max(10, total_cells // 10)
+            if cell_count % gc_frequency == 0:
+                gc.collect()
+                if grid_size > 16 and cell_count % (gc_frequency * 2) == 0 and ci_context is not None:
+                    try:
+                        ci_context.clearCaches()
+                    except Exception:
+                        pass
+    
+    return result
+
 @conditional_profile
 def generate_grid_frame(previous_frame, grid_size, current_depth):
     """Generate a grid frame for the specified depth level."""
@@ -661,7 +1324,6 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
         
         if is_apple_silicon and hardware_acceleration_available and current_depth > 1:
             try:
-                # Convert OpenCV image to Core Image
                 h, w = previous_frame.shape[:2]
                 ci_image = cv_to_ci_image(previous_frame)
                 if ci_image is None:
@@ -671,7 +1333,6 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                         logging.error("Failed to convert frame to CIImage")
                     raise ValueError("Failed to convert frame to CIImage")
                 
-                # Create scale filter
                 scale_filter = CIFilter.filterWithName_("CILanczosScaleTransform")
                 if scale_filter is None:
                     if mode == "grid":
@@ -680,13 +1341,11 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                         logging.error("Failed to create CILanczosScaleTransform filter")
                     raise ValueError("Failed to create scale filter")
                 
-                # Configure and apply filter
                 scale_filter.setValue_forKey_(ci_image, "inputImage")
                 scale = 1.0 / grid_size
                 scale_filter.setValue_forKey_(scale, "inputScale")
                 scale_filter.setValue_forKey_(1.0, "inputAspectRatio")
                 
-                # Get the output of the filter
                 output_image = scale_filter.valueForKey_("outputImage")
                 if output_image is None:
                     if mode == "grid":
@@ -695,7 +1354,6 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                         logging.error("Failed to apply scale filter")
                     raise ValueError("Failed to apply scale filter")
                 
-                # Convert back to OpenCV format
                 small_frame = ci_to_cv_image(output_image, small_w, small_h)
                 if small_frame is not None:
                     small_h, small_w = small_frame.shape[:2]
@@ -793,7 +1451,7 @@ def generate_grid_frame(previous_frame, grid_size, current_depth):
                     if mode == "grid":
                         logging.warning(f"Depth {current_depth}: Cell too small: {cell_w}x{cell_h}, using average color")
                     else:
-                        logging.warning(f"Cell too small: {actual_cell_w}x{actual_cell_h}, using average color")
+                        logging.warning(f"Cell too small: {cell_w}x{cell_h}, using average color")
                     avg_color = np.mean(small_frame, axis=(0, 1)).astype(np.uint8)
                     result[y_start:y_end, x_start:x_end] = avg_color
                     continue
@@ -970,24 +1628,64 @@ def apply_grid_effect(frame, grid_size, depth):
                 pass
 
 def get_stream_url(url):
-    """Retrieve streaming URL using yt-dlp."""
+    """Retrieve streaming URL using yt-dlp with enhanced YouTube-specific options."""
     try:
         if not url or url.strip() == "":
             logging.error("Empty URL provided to get_stream_url function")
             return None
             
         logging.info(f"Attempting to get stream URL for: {url}")
-        result = subprocess.run(["yt-dlp", "-f", "best", "--get-url", url],
-                                capture_output=True, text=True, check=True)
+        
+        # Enhanced yt-dlp options for YouTube streaming
+        yt_dlp_args = [
+            "yt-dlp", 
+            "-f", "best",                     # Get best quality stream
+            "--get-url",                      # Only print the URL
+            "--no-check-certificate",         # Skip HTTPS certificate validation
+            "--no-cache-dir",                 # Don't use cache
+            "--force-ipv4",                   # Force IPv4 to avoid some IPv6 issues
+            "--no-playlist",                  # Don't process playlists
+            "--extractor-retries", "3",       # Retry extraction 3 times
+            "--referer", "https://www.youtube.com/",  # Set referer to avoid some blocks
+            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
+            "--socket-timeout", "5",          # 5 second socket timeout
+            url
+        ]
+        
+        # Run yt-dlp with enhanced options
+        logging.debug(f"Running yt-dlp with args: {' '.join(yt_dlp_args)}")
+        result = subprocess.run(yt_dlp_args, capture_output=True, text=True, check=True)
+        
         stream_url = result.stdout.strip()
         if not stream_url:
             logging.error("yt-dlp returned an empty stream URL")
+            return None
+            
+        # Verify we have a valid HTTP(S) URL 
+        if not stream_url.startswith(('http://', 'https://')):
+            logging.error(f"yt-dlp returned an invalid URL format: {stream_url[:30]}...")
             return None
             
         logging.info(f"Successfully retrieved stream URL")
         return stream_url
     except subprocess.CalledProcessError as e:
         logging.error(f"yt-dlp failed with return code {e.returncode}: {e.stderr}")
+        # Retry with simplified options if the initial request failed
+        try:
+            logging.info("Retrying with simplified options...")
+            result = subprocess.run([
+                "yt-dlp", 
+                "-f", "best", 
+                "--get-url",
+                url
+            ], capture_output=True, text=True, check=True)
+            
+            stream_url = result.stdout.strip()
+            if stream_url:
+                logging.info("Successfully retrieved stream URL on retry")
+                return stream_url
+        except:
+            pass
         return None
     except FileNotFoundError:
         logging.error("yt-dlp not found. Please install yt-dlp.")
@@ -997,36 +1695,65 @@ def get_stream_url(url):
         return None
 
 def get_grid_layer_breakdown(grid_size, max_depth):
-    """Calculate grid layer breakdown."""
-    try:
-        if max_depth <= 0 or grid_size <= 0:
-            return [], 0, "0"
-        layer_info = []
-        total_screens = 0
-        for d in range(1, max_depth + 1):
-            screens_at_depth = grid_size ** (2 * d)
-            total_screens += screens_at_depth
-            layer_desc = (f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} (total {screens_at_depth:,} screens)" 
-                          if d == 1 else 
-                          f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} of frame {d-1} = (total {screens_at_depth:,} screens)")
-            layer_info.append(layer_desc)
-        number_units = [
-            (1e6, "million"), (1e9, "billion"), (1e12, "trillion"), (1e15, "quadrillion"), (1e18, "quintillion"),
-            (1e21, "sextillion"), (1e24, "septillion"), (1e27, "octillion"), (1e30, "nonillion"), (1e33, "decillion"),
-            (1e36, "undecillion"), (1e39, "duodecillion"), (1e42, "tredecillion"), (1e45, "quattuordecillion"),
-            (1e48, "quindecillion"), (1e51, "sexdecillion"), (1e54, "septendecillion"), (1e57, "octodecillion"),
-            (1e60, "novemdecillion"), (1e63, "vigintillion")
-        ]
-        formatted_total = f"{total_screens:,}"
-        for threshold, unit in reversed(number_units):
-            if total_screens >= threshold:
-                value = total_screens / threshold
-                formatted_total = f"{total_screens:,} ({value:.2f} {unit})"
-                break
-        return layer_info, total_screens, formatted_total
-    except Exception as e:
-        logging.error(f"Error in get_grid_layer_breakdown: {e}\n{traceback.format_exc()}")
-        return [], 0, "0"
+    """
+    Generate a breakdown of screens at each depth level of the grid effect.
+    
+    Args:
+        grid_size (int): The size of the grid (NxN).
+        max_depth (int): The maximum recursion depth.
+        
+    Returns:
+        Tuple of (list of layer strings, total screens, formatted total)
+    """
+    layer_info = []
+    total_screens = 0
+    for d in range(1, max_depth + 1):
+        screens_at_depth = grid_size ** (2 * d)
+        total_screens += screens_at_depth
+        layer_desc = (f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} (total {screens_at_depth:,} screens)" 
+                      if d == 1 else 
+                      f"Grid frame {d} - depth {d} - {grid_size}x{grid_size} of frame {d-1} = (total {screens_at_depth:,} screens)")
+        layer_info.append(layer_desc)
+    number_units = [
+        (1e6, "million"), (1e9, "billion"), (1e12, "trillion"), (1e15, "quadrillion"), (1e18, "quintillion"),
+        (1e21, "sextillion"), (1e24, "septillion"), (1e27, "octillion"), (1e30, "nonillion"), (1e33, "decillion"),
+        (1e36, "undecillion"), (1e39, "duodecillion"), (1e42, "tredecillion"), (1e45, "quattuordecillion"),
+        (1e48, "quindecillion"), (1e51, "sexdecillion"), (1e54, "septendecillion"), (1e57, "octodecillion"),
+        (1e60, "novemdecillion"), (1e63, "vigintillion")
+    ]
+    formatted_total = f"{total_screens:,}"
+    for threshold, unit in reversed(number_units):
+        if total_screens >= threshold:
+            value = total_screens / threshold
+            formatted_total = f"{total_screens:,} ({value:.2f} {unit})"
+            break
+    return layer_info, total_screens, formatted_total
+
+def get_fractal_depth_breakdown(max_depth):
+    """
+    Generate a breakdown of what happens at each depth level of the fractal depth effect.
+    
+    Args:
+        max_depth (int): The current fractal depth level.
+        
+    Returns:
+        List of strings describing each depth level.
+    """
+    depth_info = []
+    total_loops = 0
+    
+    for d in range(1, max_depth + 1):
+        new_loops = 3**d - 3**(d-1) if d > 1 else 3
+        total_loops += new_loops
+        
+        if d == 1:
+            depth_info.append(f"DEPTH {d}: 2×2 grid with original video in top-right, 3 cells with infinite recursion")
+        else:
+            depth_info.append(f"DEPTH {d}: Each recursive cell from depth {d-1} becomes a 2×2 grid, adding {new_loops:,} new infinite loops")
+    
+    depth_info.append(f"TOTAL: {total_loops:,} unique infinite loops (with infinite sub-loops each) at depth {max_depth}")
+    
+    return depth_info
 
 def start_memory_cleanup_thread():
     """Start a background thread to periodically clean memory."""
@@ -1055,7 +1782,6 @@ def start_memory_cleanup_thread():
         memory_history = []
         history_size = 5
         
-        # Use global cleanup stats instead of local
         cleanup_stats['current_interval'] = cleanup_interval
         
         try:
@@ -1074,7 +1800,6 @@ def start_memory_cleanup_thread():
                         try:
                             with objc.autorelease_pool():
                                 ci_context.clearCaches()
-                            # Only log debug level (not visible by default)
                             logging.debug("Periodic Core Image cache cleanup")
                             cleanup_stats['total_cleanups'] += 1
                         except Exception as e:
@@ -1092,7 +1817,6 @@ def start_memory_cleanup_thread():
                             memory_usage = current_process.memory_info().rss / 1024 / 1024
                             memory_history.append(memory_usage)
                             
-                            # Update stats
                             cleanup_stats['last_memory'] = memory_usage
                             cleanup_stats['peak_memory'] = max(cleanup_stats['peak_memory'], memory_usage)
                             
@@ -1107,7 +1831,6 @@ def start_memory_cleanup_thread():
                             if memory_usage > 1500 or growth_rate > 100:
                                 cleanup_interval = 1.0
                                 if growth_rate > 200:
-                                    # Only log warning for severe cases
                                     logging.debug(f"Memory growing rapidly ({growth_rate:.2f} MB), performing extra cleanup")
                                     cleanup_stats['extra_cleanups'] += 1
                                     if ci_context is not None:
@@ -1191,54 +1914,40 @@ def calculate_visible_screens(fractal_grid_size, frame_width, frame_height):
     max_level = int(np.floor(np.log(min_dim) / np.log(fractal_grid_size)))
     r = fractal_grid_size ** 2 - 1
     
-    # Count screens by category
     screens_by_category = {
         "larger_than_1px": 0,
         "exactly_1px": 0,
         "smaller_than_1px": False
     }
     
-    # Count total visible screens as before
     visible_screens = 0
     
-    # Find level where cells are approximately 1px in size
-    # We need to find the exact level where screens would be 1px
-    # This requires solving: min_dim / (fractal_grid_size ** k) ≈ 1.0
-    # k ≈ log(min_dim) / log(fractal_grid_size)
     one_pixel_level = np.log(min_dim) / np.log(fractal_grid_size)
     one_pixel_level_floor = int(np.floor(one_pixel_level))
     one_pixel_level_ceil = int(np.ceil(one_pixel_level))
     
-    # Calculate how close the floor level is to exactly 1px
     floor_cell_size = min_dim / (fractal_grid_size ** one_pixel_level_floor)
     ceil_cell_size = min_dim / (fractal_grid_size ** one_pixel_level_ceil)
     
-    # Determine which level has screens closest to 1px
     exact_pixel_level = one_pixel_level_floor if abs(floor_cell_size - 1.0) < abs(ceil_cell_size - 1.0) else one_pixel_level_ceil
     
-    for k in range(max_level + 2):  # +2 to check one level beyond visible
-        # Calculate size of cells at this level
+    for k in range(max_level + 2):
         cell_size = min_dim / (fractal_grid_size ** k)
         screens_at_level = r ** k
         
         if k <= max_level:
             visible_screens += screens_at_level
         
-        # Categorize by size
         if k == exact_pixel_level:
-            # These are the screens that are closest to exactly 1px
             screens_by_category["exactly_1px"] += screens_at_level
         elif cell_size > 1.0:
             screens_by_category["larger_than_1px"] += screens_at_level
         else:
-            # If we have cells smaller than 1px, set the flag
             screens_by_category["smaller_than_1px"] = True
     
-    # Calculate the smallest cell size
     smallest_cell_size = min_dim / (fractal_grid_size ** max_level)
     is_resolution_limited = smallest_cell_size < 1.0
     
-    # Debug output to verify calculations
     logging.debug(f"Min dimension: {min_dim}, Max level: {max_level}")
     logging.debug(f"One pixel level: {one_pixel_level}, Floor: {one_pixel_level_floor}, Ceil: {one_pixel_level_ceil}")
     logging.debug(f"Floor cell size: {floor_cell_size}, Ceil cell size: {ceil_cell_size}")
@@ -1266,10 +1975,10 @@ def main():
     global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
     global hardware_acceleration_available, force_hardware_acceleration, allow_software_fallback, is_apple_silicon
     global cap, mode, fractal_grid_size, fractal_debug, fractal_source_position, prev_output_frame, ci_context
-    global enable_memory_tracing
-    global key_pressed, key_press_start, key_last_repeat
+    global enable_memory_tracing, fractal_depth, current_stream_url, last_buffer_warning_time, frame_drop_threshold
+    global key_pressed, key_press_start, key_last_repeat, last_url_refresh_time, stream_url_refresh_interval
+    global prev_frames
     
-    # Reset key tracking dictionaries
     key_pressed = {}
     key_press_start = {}
     key_last_repeat = {}
@@ -1281,6 +1990,12 @@ def main():
     frame_surface = None
     font = None
     
+    # Initialize previous frames for fractal depth
+    prev_frames = [None] * fractal_depth  # Initialize only what's needed
+    # Track last cleanup time for fractal processing
+    last_fractal_cleanup_time = time.time()
+    fractal_cleanup_interval = 10.0  # Cleanup every 10 seconds
+    
     try:
         pygame.init()
         pygame.mixer.quit()
@@ -1290,7 +2005,6 @@ def main():
         screen_height = min(720, display_info.current_h - 100)
         screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
         
-        # Set initial background to white
         screen.fill((255, 255, 255))
         pygame.display.flip()
         
@@ -1318,7 +2032,7 @@ def main():
         parser.add_argument('--allow-software', action='store_true')
         parser.add_argument('--enable-memory-tracing', action='store_true')
         parser.add_argument('--test-hardware-accel', action='store_true')
-        parser.add_argument('--mode', type=str, choices=['grid', 'fractal'], default='fractal')
+        parser.add_argument('--mode', type=str, choices=['grid', 'fractal', 'fractal_depth'], default='fractal_depth')
         parser.add_argument('--fractal-source', type=int, choices=[1, 2, 3], default=2,
                             help='Position of source in fractal mode (1=top-left, 2=center with odd grids and 2x2 special case, 3=top-right)')
         
@@ -1328,7 +2042,6 @@ def main():
         fractal_source_position = args.fractal_source
         fractal_grid_size = args.grid_size
         
-        # If in fractal mode with position 2, ensure the grid size is odd (except for the special 2x2 case)
         if mode == "fractal" and fractal_source_position == 2 and fractal_grid_size % 2 == 0 and fractal_grid_size != 2:
             fractal_grid_size += 1
             logging.info(f"Adjusted grid size to {fractal_grid_size} for center positioning")
@@ -1346,6 +2059,15 @@ def main():
         if args.enable_memory_tracing:
             enable_memory_tracing = True
             logging.info("Memory tracing enabled via command line")
+            
+        logging.info(f"Starting in mode: {mode.upper()}")
+        if mode == "fractal_depth":
+            depth_info = get_fractal_depth_breakdown(fractal_depth)
+            for info in depth_info:
+                logging.info(f"  {info}")
+            logging.info("Use UP/DOWN arrow keys to increase/decrease depth level (1-100)")
+        elif mode == "fractal":
+            logging.info("Press 1-3 to change source position, 4 to switch to fractal depth mode")
         
         if args.test_hardware_accel:
             logging.info("=== Running hardware acceleration diagnostics ===")
@@ -1397,8 +2119,10 @@ def main():
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("Arial", 24)
         
-        # Set initial background to white
         screen.fill((255, 255, 255))
+        loading_text = font.render("Loading Video...", True, (0, 0, 0))
+        screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2,
+                                   screen.get_height() // 2 - loading_text.get_height() // 2))
         pygame.display.flip()
 
         stream_url = get_stream_url(args.youtube_url)
@@ -1408,43 +2132,34 @@ def main():
             logging.error("Exiting program due to missing stream URL")
             return
 
-        max_retries = 3
-        retry_count = 0
+        screen.fill((255, 255, 255))
+        connecting_text = font.render("Connecting to Video Stream...", True, (0, 0, 0))
+        please_wait_text = font.render("Please wait...", True, (0, 0, 0))
+        screen.blit(connecting_text, (screen.get_width() // 2 - connecting_text.get_width() // 2,
+                                     screen.get_height() // 2 - connecting_text.get_height() // 2))
+        screen.blit(please_wait_text, (screen.get_width() // 2 - please_wait_text.get_width() // 2,
+                                      screen.get_height() // 2 + 30))
+        pygame.display.flip()
+
+        # Initialize video capture
+        logging.info(f"Initializing video capture for stream: {stream_url}")
+        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
         
-        while retry_count < max_retries:
-            try:
-                logging.info(f"Attempting to open video stream (attempt {retry_count+1}/{max_retries})")
-                cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-                if cap.isOpened():
-                    logging.info("Successfully opened video stream")
-                    break
-                else:
-                    logging.warning(f"Failed to open video stream on attempt {retry_count+1}")
-                    retry_count += 1
-                    time.sleep(1)
-            except Exception as e:
-                logging.error(f"Error opening video stream: {e}")
-                retry_count += 1
-                time.sleep(1)
-                
-        if cap is None or not cap.isOpened():
-            logging.error(f"Failed to open video stream after {max_retries} attempts: {stream_url}")
+        if not cap.isOpened():
+            logging.error(f"Failed to open video stream: {stream_url}")
             logging.error("Please check your internet connection and YouTube URL validity")
             return
+            
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        logging.debug(f"Capture resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-
-        # Initialize frame_surface with video frame dimensions
+        
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         frame_surface = pygame.Surface((frame_width, frame_height))
-
-        screen.fill((255, 255, 255))
-        loading_text = font.render("Loading video stream...", True, (0, 0, 0))
-        screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2,
-                                   screen.get_height() // 2 - loading_text.get_height() // 2))
-        pygame.display.flip()
+        
+        # Start the frame reader thread with original YouTube URL for refreshes
+        start_frame_reader_thread(cap, stream_url, youtube_url, buffer_size=frame_buffer_size)
+        logging.info("Started background frame reader thread")
 
         last_frame_time = time.time()
         last_status_time = time.time()
@@ -1456,44 +2171,65 @@ def main():
         total_process_time = 0
         frame_counter = 0
 
+        # Wait for buffer to start filling before entering main loop
+        buffer_wait_start = time.time()
+        buffer_wait_timeout = 5.0  # Wait up to 5 seconds for buffer to start filling
+        while time.time() - buffer_wait_start < buffer_wait_timeout:
+            if frame_buffer is not None and not frame_buffer.empty():
+                logging.info(f"Buffer started filling after {time.time() - buffer_wait_start:.1f} seconds")
+                break
+            time.sleep(0.1)
+            
+            # Update screen with a loading message
+            screen.fill((0, 0, 0))
+            if font is None:
+                font = pygame.font.SysFont('Arial', 24)
+            loading_text = font.render(f"Loading stream... ({int(time.time() - buffer_wait_start)}s)", True, (255, 255, 255))
+            screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2, 
+                                       screen.get_height() // 2 - loading_text.get_height() // 2))
+            pygame.display.flip()
+
         while running:
             current_time = time.time()
+            frame_start_time = time.time()
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     key = pygame.key.name(event.key)
-                    # Handle key immediately regardless of type
-                    if key in ['up', 'down', 'd', 's', 'f'] or key in '0123456789':
-                        handle_keyboard_event(key)
+                    mod = event.mod
                     
-                    # Set up repeat tracking for arrow keys
+                    if key in ['up', 'down', 'd', 's', 'f']:
+                        handle_keyboard_event(key, mod)
+                    elif key in '0123456789':
+                        if mode != "fractal_depth":
+                            handle_keyboard_event(key, mod)
+                    
                     if key in ['up', 'down']:
                         key_pressed[key] = True
                         key_press_start[key] = current_time
-                        key_last_repeat[key] = current_time  # Initialize repeat timer on first press
+                        key_last_repeat[key] = current_time
                 elif event.type == pygame.KEYUP:
                     key = pygame.key.name(event.key)
                     if key in ['up', 'down']:
                         key_pressed[key] = False
-                        key_last_repeat.pop(key, None)  # Clean up repeat timer
+                        key_last_repeat.pop(key, None)
 
-            # Handle continuous key presses for arrow keys
             for key in ['up', 'down']:
                 if key_pressed.get(key, False):
                     press_duration = current_time - key_press_start.get(key, current_time)
                     last_repeat_time = key_last_repeat.get(key, 0)
                     
-                    # First repeat after initial delay, then continuous repeats at set interval
                     if press_duration >= key_repeat_delay and (current_time - last_repeat_time) >= key_repeat_interval:
                         handle_keyboard_event(key)
                         key_last_repeat[key] = current_time
 
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                logging.warning(f"Failed to read frame from stream: {stream_url}")
-                time.sleep(0.1)
+            # Get the latest frame from the buffer
+            frame = get_latest_frame()
+            if frame is None:
+                # If no frame is available, wait a bit and continue
+                time.sleep(0.01)  # Very short wait - faster recovery
                 continue
             frame_count += 1
 
@@ -1509,6 +2245,87 @@ def main():
                 else:
                     processed_frame = create_fractal_grid(frame, prev_output_frame, fractal_grid_size, fractal_source_position)
                     prev_output_frame = processed_frame.copy()
+            elif mode == "fractal_depth":
+                if fractal_debug:
+                    processed_frame = frame.copy()
+                else:
+                    current_time = time.time()
+                    try:
+                        # Check if we need to clean up previous frames periodically
+                        if current_time - last_fractal_cleanup_time > fractal_cleanup_interval:
+                            logging.debug("Performing periodic cleanup of fractal depth memory")
+                            for i in range(len(prev_frames)):
+                                if prev_frames[i] is not None and i >= fractal_depth:
+                                    prev_frames[i] = None
+                            gc.collect()
+                            last_fractal_cleanup_time = current_time
+                            
+                        temp = frame.copy()  # Start with a copy to avoid modifying the original
+                        
+                        if is_apple_silicon and hardware_acceleration_available:
+                            # Use autorelease pool for Apple Silicon
+                            import objc
+                            with objc.autorelease_pool():
+                                # Ensure prev_frames is properly sized
+                                if len(prev_frames) < fractal_depth:
+                                    prev_frames.extend([None] * (fractal_depth - len(prev_frames)))
+                                
+                                for d in range(fractal_depth):
+                                    if prev_frames[d] is None:
+                                        prev_frames[d] = np.zeros_like(frame)
+                                    new_frame = create_fractal_grid(temp, prev_frames[d], 2, 3)
+                                    
+                                    # Clean up old frame before replacing
+                                    old_frame = prev_frames[d]
+                                    prev_frames[d] = new_frame.copy()
+                                    
+                                    # Update temp and clean up
+                                    old_temp = temp
+                                    temp = new_frame
+                                    
+                                    # Clean up references we no longer need
+                                    del old_frame
+                                    if d > 0:  # Don't delete the original frame
+                                        del old_temp
+                                    del new_frame
+                                    
+                                    # Force immediate garbage collection during deep recursion
+                                    if d > 50 and d % 10 == 0:  # For very deep levels, collect more aggressively
+                                        gc.collect()
+                        else:
+                            # For non-Apple Silicon, still implement good memory management
+                            # Ensure prev_frames is properly sized
+                            if len(prev_frames) < fractal_depth:
+                                prev_frames.extend([None] * (fractal_depth - len(prev_frames)))
+                            
+                            for d in range(fractal_depth):
+                                if prev_frames[d] is None:
+                                    prev_frames[d] = np.zeros_like(frame)
+                                new_frame = create_fractal_grid(temp, prev_frames[d], 2, 3)
+                                
+                                # Clean up old frame before replacing
+                                old_frame = prev_frames[d]
+                                prev_frames[d] = new_frame.copy()
+                                
+                                # Update temp and clean up
+                                old_temp = temp
+                                temp = new_frame
+                                
+                                # Clean up references we no longer need
+                                del old_frame
+                                if d > 0:  # Don't delete the original frame
+                                    del old_temp
+                                del new_frame
+                                
+                                # Force immediate garbage collection during deep recursion
+                                if d > 50 and d % 10 == 0:  # For very deep levels, collect more aggressively
+                                    gc.collect()
+                                
+                        processed_frame = temp
+                        
+                    except Exception as e:
+                        logging.error(f"Error in fractal_depth processing: {e}\n{traceback.format_exc()}")
+                        processed_frame = frame.copy()
             
             if processed_frame is None:
                 logging.warning("Processed frame is None, using original frame")
@@ -1536,7 +2353,6 @@ def main():
                 screen.blit(scaled_surface, (0, 0))
                 displayed_count += 1
                 
-                # Periodic cache clearing every 10 frames
                 if frame_count % 10 == 0 and ci_context is not None:
                     ci_context.clearCaches()
                 
@@ -1548,22 +2364,23 @@ def main():
                         hw_status += " (Software Fallback)"
                     texts = [
                         f"Mode: {mode.upper()}",
-                        f"Grid: {grid_size if mode == 'grid' else fractal_grid_size}x{grid_size if mode == 'grid' else fractal_grid_size}",
-                        f"Depth: {depth if mode == 'grid' else 'N/A'}",
+                        f"Grid: {grid_size if mode == 'grid' else fractal_grid_size if mode == 'fractal' else 2}x{grid_size if mode == 'grid' else fractal_grid_size if mode == 'fractal' else 2}",
                     ]
+                    if mode == "grid":
+                        texts.append(f"Depth: {depth}")
+                    elif mode == "fractal_depth":
+                        texts.append(f"Depth: {fractal_depth}")
+                    else:
+                        texts.append("Depth: N/A")
                     
-                    # Add source position information for fractal mode
-                    if mode == "fractal":
-                        position_desc = {
-                            1: "top-left",
-                            2: "center",
-                            3: "top-right"
-                        }
-                        # Special case for 2x2 grid in position 2
-                        if fractal_source_position == 2 and fractal_grid_size == 2:
-                            texts.append(f"Source: top-right (special 2x2 case)")
-                        else:
+                    if mode in ["fractal", "fractal_depth"]:
+                        position_desc = {1: "top-left", 2: "center", 3: "top-right"}
+                        if mode == "fractal" and fractal_source_position == 2 and fractal_grid_size == 2:
+                            texts.append("Source: top-right (special 2x2 case)")
+                        elif mode == "fractal":
                             texts.append(f"Source: {position_desc[fractal_source_position]}")
+                        else:
+                            texts.append("Source: top-right")
                     
                     texts.extend([
                         f"Debug: {'On' if (debug_mode if mode == 'grid' else fractal_debug) else 'Off'}",
@@ -1590,18 +2407,24 @@ def main():
                         visible_recursive_cells = calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_height)
                         texts.append("")
                         texts.append("Fractal Screens:")
-                        
-                        # Format: "Infinite screens: [calculate the number of cells] 𝕏XX clusters of screens, each to infinity = XXXXX infinities of screens"
                         texts.append(f"  Infinite Screens: {visible_recursive_cells:,} clusters of screens, each to infinity = {visible_recursive_cells:,} infinities of screens")
-                    texts.append(f"Mode: {'DEBUG' if debug_mode else 'GRID'} (press 'd' to toggle)")
+                    elif mode == "fractal_depth":
+                        texts.append("")
+                        texts.append("Fractal Depth Breakdown:")
+                        depth_info = get_fractal_depth_breakdown(fractal_depth)
+                        for info in depth_info:
+                            texts.append(f"  {info}")
                     texts.append("")
-                    texts.append("")
-                    # Modify help text based on mode
                     if mode == "grid":
-                        texts.append("Press s to show/hide this info, d to debug, up/down grid size, 1 - 0 multiply depth")
-                    else:
+                        texts.append("Press s to show/hide this info, d to debug, up/down to change grid size")
+                        texts.append("Press 1-0 to set recursion depth (1-10)")
+                    elif mode == "fractal":
                         texts.append("Press s to show/hide this info, d to debug, up/down grid size, f to switch modes")
                         texts.append("Press 1-3 to change source position: 1=top-left, 2=center (odd grids + 2x2 special case), 3=top-right")
+                        texts.append("Press 4 to switch to fractal depth mode")
+                    elif mode == "fractal_depth":
+                        texts.append("Press s to show/hide this info, d to debug, f to switch modes")
+                        texts.append("Press UP/DOWN arrow keys to increase/decrease depth level (1-100)")
                     line_height = 25
                     padding = 20
                     required_height = len(texts) * line_height + padding * 2
@@ -1706,6 +2529,25 @@ def main():
             if 'rgb_frame' in locals():
                 del rgb_frame
 
+            # Enhanced cleanup for fractal processing
+            for fractal_var in ['temp', 'new_frame', 'old_frame', 'old_temp']:
+                if fractal_var in locals():
+                    try:
+                        del locals()[fractal_var]
+                    except Exception as e:
+                        if debug_mode:
+                            logging.debug(f"Error cleaning up {fractal_var}: {e}")
+
+            # Perform more aggressive cleanup for fractal depth mode
+            if mode == "fractal_depth" and frame_counter % 30 == 0:  # Every 30 frames (about once per second)
+                # Clean up unused prev_frames to prevent memory buildup
+                if len(prev_frames) > fractal_depth:
+                    # Set all excess frames to None and truncate the list
+                    for i in range(fractal_depth, len(prev_frames)):
+                        prev_frames[i] = None
+                    prev_frames[fractal_depth:] = []
+                    gc.collect()
+
             frame_counter += 1
 
             memory_usage = process.memory_info().rss / 1024 / 1024
@@ -1719,20 +2561,19 @@ def main():
                         f"===== PERFORMANCE SUMMARY =====",
                     ]
                     
-                    # Only show depth in grid mode
                     if mode == "grid":
                         summary_lines.append(f"Configuration: Grid {grid_size}x{grid_size}, Depth {depth}, Mode: {mode.upper()}")
-                    else:
-                        position_desc = {
-                            1: "top-left",
-                            2: "center",
-                            3: "top-right"
-                        }
-                        # Special case for 2x2 grid in position 2
+                    elif mode == "fractal":
+                        position_desc = {1: "top-left", 2: "center", 3: "top-right"}
                         if fractal_source_position == 2 and fractal_grid_size == 2:
                             summary_lines.append(f"Configuration: Fractal {fractal_grid_size}x{fractal_grid_size}, Source: top-right (special 2x2 case), Mode: {mode.upper()}")
                         else:
                             summary_lines.append(f"Configuration: Fractal {fractal_grid_size}x{fractal_grid_size}, Source: {position_desc[fractal_source_position]}, Mode: {mode.upper()}")
+                    elif mode == "fractal_depth":
+                        summary_lines.append(f"Configuration: Fractal Depth 2x2, Depth {fractal_depth}, Source: top-right, Mode: {mode.upper()}")
+                        depth_info = get_fractal_depth_breakdown(fractal_depth)
+                        for info in depth_info:
+                            summary_lines.append(f"  {info}")
                     
                     summary_lines.extend([
                         f"Frames: Captured {frame_count}, Displayed {displayed_count}, Dropped {dropped_count}",
@@ -1757,7 +2598,6 @@ def main():
                         reduction_ratio = last_original / max(1, last_small)
                         summary_lines.append(f"Downsampling: {avg_downsample_time:.1f}ms, Reduction Ratio: {reduction_ratio:.1f}x")
                     
-                    # Add memory cleanup stats to summary
                     if is_apple_silicon and hardware_acceleration_available:
                         summary_lines.append(f"Memory Management: {cleanup_stats['total_cleanups']} cleanups ({cleanup_stats['extra_cleanups']} emergency), interval: {cleanup_stats['current_interval']:.1f}s")
                         
@@ -1792,6 +2632,18 @@ def main():
             
             clock.tick(30)
 
+            # Add frame rate control for the main loop
+            frame_processing_time = time.time() - frame_start_time
+            target_frame_time = 1.0 / 30  # Target 30 FPS
+            
+            if frame_processing_time < target_frame_time:
+                # Only sleep if we're ahead of schedule
+                time.sleep(target_frame_time - frame_processing_time)
+
+        # Stop the frame reader thread
+        logging.info("Shutting down frame reader thread...")
+        stop_frame_reader_thread()
+            
         cap.release()
         pygame.quit()
         logging.info("Shutdown complete")

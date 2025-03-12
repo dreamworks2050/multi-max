@@ -28,7 +28,8 @@ MANIFEST
 # PyInstaller
 #  Usually these files are written by a PyInstaller build script
 *.manifest
-*.spec
+# Don't ignore custom spec files for this project
+# *.spec
 
 # Installer logs
 pip-log.txt
@@ -140,3 +141,48 @@ Icon
 profiling_results/
 memory_dumps/
 logs/
+
+# Multi-Max specific entries
+# Dependency copy directories created by copy_dependencies.py
+*_copy/
+cv2_copy/
+numpy_copy/
+pygame_copy/
+dotenv_copy/
+psutil_copy/
+PyObjCTools_copy/
+Foundation_copy/
+Cocoa_copy/
+CoreFoundation_copy/
+AppKit_copy/
+objc_copy/
+Quartz_copy/
+memory_profiler_copy/
+
+# PyInstaller working directories
+pyinstaller_workdir/
+
+# Temporary test files
+simple_test.py
+test_*.py
+direct_test
+direct.spec
+
+# Keep specific project files
+!main.spec
+!main.spec.template
+!infinite_fractal.py
+
+# IDE settings
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Backup files
+*~
+*.bak
+*.swp
+
+# Generated documentation
+docs/generated/
