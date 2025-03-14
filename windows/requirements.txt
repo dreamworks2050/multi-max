@@ -1,0 +1,21 @@
+# Multi-Max: Recursive Video Grid - Windows Required Dependencies
+
+# Core dependencies
+opencv-python>=4.7.0    # Video capture and image processing
+numpy>=1.22.0           # Efficient array operations
+pygame>=2.1.0           # Display and user interface
+python-dotenv>=0.20.0   # Environment variable management
+psutil>=5.9.0           # Process and system monitoring
+
+# Performance analysis tools
+memory-profiler>=0.60.0 # Memory usage analysis
+yt-dlp>=2023.3.4        # YouTube stream URL extraction
+
+# External tools (install separately via package manager)
+# - FFmpeg (with streaming support)
+# - yt-dlp command-line tool if not using Python package
+
+# Development tools (optional)
+# pytest>=7.0.0         # Testing framework
+# flake8>=5.0.0         # Code linting
+# black>=22.0.0         # Code formatting 

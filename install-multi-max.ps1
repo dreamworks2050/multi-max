@@ -316,36 +316,34 @@ if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) {
 
 # Step 11: Set up environment configuration
 Write-ColorOutput "Setting up environment configuration..." "Yellow"
-if (Test-Path ".env") {
-    Write-ColorOutput ".env file already exists. Keeping existing configuration." "Green"
-    Write-ColorOutput "To reset to defaults, delete .env and run the installer again." "Yellow"
-} elseif (Test-Path ".env.template") {
-    Write-ColorOutput "Creating .env file from template..." "Yellow"
-    Copy-Item ".env.template" ".env"
-    Write-ColorOutput ".env file created successfully." "Green"
-    
-    # Configure .env for Windows
-    try {
-        $envContent = Get-Content ".env" -Raw
+$envPath = Join-Path $installDir ".env"
+$envTemplatePath = Join-Path $installDir ".env.template"
+
+# Check if Windows-specific .env exists in the windows directory
+$windowsEnvPath = Join-Path $installDir "windows\.env"
+if (Test-Path $windowsEnvPath) {
+    Write-ColorOutput "Found Windows-specific environment configuration." "Green"
+    Copy-Item -Path $windowsEnvPath -Destination $envPath -Force
+    Write-ColorOutput "Windows environment configuration copied to .env" "Green"
+} else {
+    # If Windows-specific environment doesn't exist, create from template with Windows settings
+    if (Test-Path $envTemplatePath) {
+        $envContent = Get-Content $envTemplatePath -Raw
+        
+        # Modify environment settings for Windows
         $envContent = $envContent -replace "FORCE_HARDWARE_ACCELERATION=true", "FORCE_HARDWARE_ACCELERATION=false"
         $envContent = $envContent -replace "ALLOW_SOFTWARE_FALLBACK=false", "ALLOW_SOFTWARE_FALLBACK=true"
-        Set-Content ".env" $envContent
-        Write-ColorOutput ".env configured for Windows." "Green"
-    } catch {
-        Write-ColorOutput "Failed to configure .env file: $_" "Red"
+        
+        # Add Windows-specific settings
+        $envContent += "`n# Windows-specific settings`n"
+        $envContent += "WINDOWS_MODE=true`n"
+        $envContent += "USE_SOFTWARE_RENDERING=true`n"
+        
+        $envContent | Out-File -FilePath $envPath -Encoding utf8
+        Write-ColorOutput "Environment configuration created for Windows compatibility" "Green"
+    } else {
+        Write-ColorOutput "Environment template not found. Skipping environment configuration." "Yellow"
     }
-} else {
-    Write-ColorOutput ".env.template not found! Creating basic .env file..." "Yellow"
-    @"
-# Multi-Max Environment Configuration - Auto-generated
-FORCE_HARDWARE_ACCELERATION=false
-ALLOW_SOFTWARE_FALLBACK=true
-DEFAULT_VIDEO_URL=https://www.youtube.com/watch?v=dQw4w9WgXcQ
-ENABLE_MEMORY_TRACING=false
-LOG_LEVEL=INFO
-FRAME_BUFFER_SIZE=60
-"@ | Set-Content ".env"
-    Write-ColorOutput "Basic .env file created." "Green"
 }
 
 # Step 12: Create desktop shortcut (automatic)
@@ -383,7 +381,99 @@ python main.py
     Write-ColorOutput "Created fallback batch file at Desktop\Multi-Max.bat" "Green"
 }
 
-# Step 13: Installation complete
+# Step 13: Set up Windows-specific version
+Write-ColorOutput "Setting up Windows-specific version..." "Yellow"
+$windowsMainPath = Join-Path $installDir "windows\main.py"
+$originalMainPath = Join-Path $installDir "main.py"
+$backupMainPath = Join-Path $installDir "main.py.mac-backup"
+$windowsRequirementsPath = Join-Path $installDir "windows\requirements.txt"
+
+# On Windows, we always want to use the Windows version
+if (Test-Path $windowsMainPath) {
+    Write-ColorOutput "Windows-specific version found in the repository." "Green"
+    
+    # Check if the file actually contains the Windows-specific marker
+    $containsWindowsMarker = Get-Content $windowsMainPath -Raw | Select-String -Pattern "__windows_specific_version__" -Quiet
+    
+    if (-not $containsWindowsMarker) {
+        Write-ColorOutput "WARNING: The file in windows/main.py does not contain the Windows version marker." "Yellow"
+        Write-ColorOutput "It may not be properly adapted for Windows systems." "Yellow"
+    } else {
+        Write-ColorOutput "Confirmed file contains Windows-specific code." "Green"
+    }
+    
+    # Backup original Mac version if not already backed up
+    if (-not (Test-Path $backupMainPath) -and (Test-Path $originalMainPath)) {
+        Copy-Item -Path $originalMainPath -Destination $backupMainPath -Force
+        Write-ColorOutput "Original Mac version backed up to main.py.mac-backup" "Green"
+    }
+    
+    # Copy Windows version to main.py
+    Copy-Item -Path $windowsMainPath -Destination $originalMainPath -Force
+    Write-ColorOutput "Windows-specific version installed successfully" "Green"
+    
+    # Install Windows-specific requirements if available
+    if (Test-Path $windowsRequirementsPath) {
+        Write-ColorOutput "Installing Windows-specific requirements..." "Yellow"
+        try {
+            if ($uvInstalled) {
+                # Use the direct function if defined, otherwise try the command
+                if (Get-Command Invoke-UV -ErrorAction SilentlyContinue) {
+                    Invoke-UV @("pip", "install", "-r", $windowsRequirementsPath)
+                } else {
+                    uv pip install -r $windowsRequirementsPath
+                }
+            } else {
+                python -m pip install -r $windowsRequirementsPath
+            }
+            Write-ColorOutput "Windows-specific requirements installed successfully." "Green"
+        } catch {
+            Write-ColorOutput "Failed to install Windows-specific requirements: $_" "Red"
+            Write-ColorOutput "Some Windows features may not work correctly." "Yellow"
+        }
+    }
+} else {
+    Write-ColorOutput "ERROR: Windows-specific version not found in the repository!" "Red"
+    Write-ColorOutput "The application may not work correctly on Windows." "Red"
+    Write-ColorOutput "Please make sure the repository includes a 'windows' folder with the Windows version." "Red"
+    
+    # Create a simple version check script that will warn the user
+    $warningScript = @"
+import platform
+import os
+import sys
+
+if platform.system() == 'Windows':
+    print("WARNING: You are running on Windows but the Windows-specific version was not found.")
+    print("The application may not work correctly. Mac-specific dependencies may cause errors.")
+    print("Please download a proper Windows version from the repository.")
+    input("Press Enter to try to continue anyway...")
+
+# Continue to the original script
+exec(open('main.py.mac-backup').read())
+"@
+    
+    # Only create this warning script if we have the Mac backup
+    if (Test-Path $backupMainPath) {
+        $warningScript | Out-File -FilePath $originalMainPath -Encoding utf8
+        Write-ColorOutput "Created a warning script that will notify the user about potential issues." "Yellow"
+    }
+}
+
+# Explicitly check if we're using the Windows version
+if ((Test-Path $originalMainPath) -and (Get-Content $originalMainPath -Raw | Select-String -Pattern "__windows_specific_version__" -Quiet)) {
+    Write-ColorOutput "Confirmed Windows-specific version is active and properly installed." "Green"
+} else {
+    if (Test-Path $windowsMainPath) {
+        # Force copy the Windows version again
+        Copy-Item -Path $windowsMainPath -Destination $originalMainPath -Force
+        Write-ColorOutput "Re-applied Windows-specific version." "Green"
+    } else {
+        Write-ColorOutput "ERROR: Could not apply Windows-specific version. The app may not work properly on Windows." "Red"
+    }
+}
+
+# Step 14: Installation complete
 Write-ColorOutput "=========================================" "Cyan"
 Write-ColorOutput "      Multi-Max Installation Complete     " "Cyan"
 Write-ColorOutput "=========================================" "Cyan"
@@ -421,4 +511,12 @@ try {
     Write-ColorOutput "2. Run the script: .\run.ps1" "Yellow"
     # Exit without prompting
     exit 0
-} 
+}
+
+Write-ColorOutput "Installation completed successfully!" "Green"
+Write-ColorOutput "You can now run Multi-Max by activating the virtual environment and running main.py:" "Green"
+Write-ColorOutput "cd $installDir" "Cyan"
+Write-ColorOutput "$venvName\Scripts\Activate.ps1" "Cyan"
+Write-ColorOutput "python main.py" "Cyan"
+Write-ColorOutput "" "Green"
+Write-ColorOutput "Note: This Windows version uses software rendering mode. Some features may be limited compared to the Mac version." "Yellow" 
