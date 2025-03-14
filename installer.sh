@@ -146,17 +146,17 @@ install_ffmpeg() {
 install_python_deps() {
     echo -e "${YELLOW}Step 4: Installing Python dependencies...${NC}"
     
-    # Create and activate virtual environment
-    if [[ ! -d "venv" ]]; then
-        echo -e "${YELLOW}Creating virtual environment...${NC}"
-        $PYTHON -m venv venv
+    # Create and activate virtual environment named "multi-max"
+    if [[ ! -d "multi-max" ]]; then
+        echo -e "${YELLOW}Creating virtual environment 'multi-max'...${NC}"
+        $PYTHON -m venv multi-max
     fi
     
     # Determine activation script based on OS
     if [[ "$OS" == "windows" ]]; then
-        source venv/Scripts/activate
+        source multi-max/Scripts/activate
     else
-        source venv/bin/activate
+        source multi-max/bin/activate
     fi
     
     # Initialize UV_INSTALLED flag
@@ -400,7 +400,7 @@ cd "$APP_DIR"
 osascript <<EOF
 tell application "Terminal"
     activate
-    do script "cd '$APP_DIR' && source venv/bin/activate && python main.py; exit"
+    do script "cd '$APP_DIR' && source multi-max/bin/activate && python main.py; exit"
 end tell
 EOF
 EOL
@@ -442,7 +442,7 @@ EOL
         cat > "$DESKTOP_DIR/Run-Multi-Max.command" << EOL
 #!/bin/bash
 cd "$APP_DIR"
-source venv/bin/activate
+source multi-max/bin/activate
 python main.py
 EOL
         chmod +x "$DESKTOP_DIR/Run-Multi-Max.command"
@@ -484,7 +484,7 @@ Version=1.0
 Type=Application
 Name=Multi-Max
 Comment=Multi-Max Recursive Video Grid
-Exec=bash -c "cd $APP_DIR && source venv/bin/activate && python main.py"
+Exec=bash -c "cd $APP_DIR && source multi-max/bin/activate && python main.py"
 Icon=$ICON_PATH
 Terminal=false
 Categories=Video;AudioVideo;Graphics;
@@ -502,7 +502,7 @@ EOL
         cat > "$DESKTOP_DIR/Multi-Max.bat" << EOL
 @echo off
 cd "$APP_DIR"
-call venv\Scripts\activate.bat
+call multi-max\Scripts\activate.bat
 python main.py
 EOL
         
@@ -612,17 +612,17 @@ main() {
     
     echo -e "${BLUE}=========================================${NC}"
     echo -e "${BLUE}  To run the application:                ${NC}"
-    echo -e "${BLUE}  1. source venv/bin/activate            ${NC}"
+    echo -e "${BLUE}  1. source multi-max/bin/activate       ${NC}"
     echo -e "${BLUE}  2. python main.py                      ${NC}"
     echo -e "${BLUE}=========================================${NC}"
     echo -e "${BLUE}  Environment configuration is in .env   ${NC}"
     echo -e "${BLUE}  Edit this file to customize settings   ${NC}"
     echo -e "${BLUE}=========================================${NC}"
     
-    # Check if venv is already activated
+    # Check if virtual environment is already activated
     if [[ "$VIRTUAL_ENV" == "" ]]; then
         echo -e "${YELLOW}Virtual environment is not activated. Activate it with:${NC}"
-        echo -e "${YELLOW}  source venv/bin/activate${NC}"
+        echo -e "${YELLOW}  source multi-max/bin/activate${NC}"
     fi
 }
 

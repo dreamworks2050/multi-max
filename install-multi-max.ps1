@@ -193,10 +193,11 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 
 # Step 7: Set up virtual environment
 Write-ColorOutput "Setting up Python virtual environment..." "Yellow"
-if (-not (Test-Path "venv")) {
+$venvName = "multi-max"
+if (-not (Test-Path $venvName)) {
     try {
-        python -m venv venv
-        Write-ColorOutput "Virtual environment created successfully." "Green"
+        python -m venv $venvName
+        Write-ColorOutput "Virtual environment '$venvName' created successfully." "Green"
     } catch {
         Write-ColorOutput "Failed to create virtual environment: $_" "Red"
         exit 1
@@ -206,64 +207,88 @@ if (-not (Test-Path "venv")) {
 # Activate virtual environment
 Write-ColorOutput "Activating virtual environment..." "Yellow"
 try {
-    & .\venv\Scripts\Activate.ps1
+    & .\$venvName\Scripts\Activate.ps1
     Write-ColorOutput "Virtual environment activated." "Green"
 } catch {
     Write-ColorOutput "Failed to activate virtual environment: $_" "Red"
     Write-ColorOutput "Trying to continue anyway..." "Yellow"
 }
 
-# Step 8: Install UV package manager
+# Step 8: Install UV package manager (prioritized)
 Write-ColorOutput "Installing UV package manager..." "Yellow"
 $uvInstalled = $false
 try {
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-        # Install uv using pip
-        python -m pip install uv
+    # Upgrade pip first
+    python -m pip install --upgrade pip
+    
+    # Install UV - try multiple methods to ensure it's installed
+    Write-ColorOutput "Installing UV using pip..." "Yellow"
+    python -m pip install uv
+    
+    # Check if UV is in PATH
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        Write-ColorOutput "UV package manager installed successfully." "Green"
+        $uvInstalled = $true
+    } else {
+        Write-ColorOutput "UV not found in PATH after pip install. Trying alternative installation method..." "Yellow"
         
-        # Check if uv was installed correctly
+        # Alternative method - direct install script
+        Invoke-WebRequest -Uri "https://astral.sh/uv/install.ps1" -OutFile "$tempDir\install-uv.ps1"
+        & $tempDir\install-uv.ps1
+        
+        # Update PATH and check again
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        
         if (Get-Command uv -ErrorAction SilentlyContinue) {
-            Write-ColorOutput "UV package manager installed successfully." "Green"
+            Write-ColorOutput "UV package manager installed successfully using install script." "Green"
             $uvInstalled = $true
         } else {
-            Write-ColorOutput "Failed to install UV with pip. Trying alternative method..." "Yellow"
+            Write-ColorOutput "UV still not found in PATH. One more attempt with direct path..." "Yellow"
             
-            # Alternative method: Download and run the install script
-            Invoke-WebRequest -Uri "https://astral.sh/uv/install.ps1" -OutFile "$tempDir\install-uv.ps1"
-            & $tempDir\install-uv.ps1
-            
-            # Refresh environment
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-            
-            if (Get-Command uv -ErrorAction SilentlyContinue) {
-                Write-ColorOutput "UV package manager installed successfully (alternative method)." "Green"
+            # Try to find UV in the Python scripts directory
+            $uvPath = Join-Path (Join-Path $installDir $venvName) "Scripts\uv.exe"
+            if (Test-Path $uvPath) {
+                Write-ColorOutput "Found UV at: $uvPath" "Green"
                 $uvInstalled = $true
+                
+                # Create a function to call UV directly
+                function Invoke-UV {
+                    param([string[]]$Arguments)
+                    & $uvPath $Arguments
+                    return $?
+                }
             } else {
-                Write-ColorOutput "Failed to install UV package manager. Falling back to pip." "Yellow"
+                Write-ColorOutput "Failed to install UV via any method. Falling back to pip for installations." "Red"
+                $uvInstalled = $false
             }
         }
-    } else {
-        Write-ColorOutput "UV package manager is already installed." "Green"
-        $uvInstalled = $true
     }
 } catch {
     Write-ColorOutput "Error installing UV package manager: $_" "Red"
     Write-ColorOutput "Falling back to pip for package installation." "Yellow"
 }
 
-# Step 9: Install Python requirements
+# Step 9: Install Python requirements - prioritize UV
 Write-ColorOutput "Installing Python requirements..." "Yellow"
 if (Test-Path "requirements.txt") {
     try {
         if ($uvInstalled) {
             Write-ColorOutput "Installing packages using UV (faster)..." "Yellow"
-            uv pip install -r requirements.txt
+            
+            # Use the direct function if defined, otherwise try the command
+            if (Get-Command Invoke-UV -ErrorAction SilentlyContinue) {
+                Invoke-UV @("pip", "install", "-r", "requirements.txt")
+            } else {
+                uv pip install -r requirements.txt
+            }
+            
             if (-not $?) {
                 throw "UV installation failed with exit code $LASTEXITCODE. Falling back to pip."
+            } else {
+                Write-ColorOutput "Successfully installed requirements using UV." "Green"
             }
         } else {
             Write-ColorOutput "Installing packages using pip..." "Yellow"
-            python -m pip install --upgrade pip
             python -m pip install -r requirements.txt
             if (-not $?) {
                 throw "Pip installation failed with exit code $LASTEXITCODE"
@@ -350,7 +375,7 @@ if ($createShortcut -eq "y" -or $createShortcut -eq "Y") {
         @"
 # Launcher for Multi-Max
 Set-Location "$installDir"
-& .\venv\Scripts\Activate.ps1
+& .\$venvName\Scripts\Activate.ps1
 python main.py
 "@ | Set-Content "run.ps1"
         
@@ -362,7 +387,7 @@ python main.py
         @"
 @echo off
 cd "$installDir"
-call venv\Scripts\activate.bat
+call $venvName\Scripts\activate.bat
 python main.py
 "@ | Set-Content "$env:USERPROFILE\Desktop\Multi-Max.bat"
         
@@ -375,7 +400,7 @@ python main.py
     @"
 # Launcher for Multi-Max
 Set-Location "$installDir"
-& .\venv\Scripts\Activate.ps1
+& .\$venvName\Scripts\Activate.ps1
 python main.py
 "@ | Set-Content "run.ps1"
     
@@ -397,10 +422,10 @@ Write-ColorOutput "  Environment configuration is in .env    " "Cyan"
 Write-ColorOutput "  Edit this file to customize settings    " "Cyan"
 Write-ColorOutput "=========================================" "Cyan"
 
-# Remind about manual activation of venv if not already activated
+# Remind about manual activation of venv (with updated venv name)
 if (-not (Test-Path env:VIRTUAL_ENV)) {
     Write-ColorOutput "Virtual environment is not activated. Activate it with:" "Yellow"
-    Write-ColorOutput "  .\venv\Scripts\Activate.ps1" "Yellow"
+    Write-ColorOutput "  .\$venvName\Scripts\Activate.ps1" "Yellow"
 }
 
 # Keep window open
