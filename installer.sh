@@ -383,25 +383,30 @@ create_desktop_shortcut() {
     if [[ "$OS" == "macos" ]]; then
         echo -e "${YELLOW}Creating macOS application launcher...${NC}"
         
-        # Create the AppleScript
+        # Create the app bundle
         DESKTOP_DIR="$HOME/Desktop"
         APP_NAME="Multi-Max"
         SCRIPT_PATH="$DESKTOP_DIR/$APP_NAME.app/Contents/MacOS"
         
         # Create directory structure
         mkdir -p "$SCRIPT_PATH"
+        mkdir -p "$DESKTOP_DIR/$APP_NAME.app/Contents/Resources"
         
-        # Create the executable script
+        # Create the executable script with proper Terminal handling
         cat > "$SCRIPT_PATH/$APP_NAME" << EOL
 #!/bin/bash
 cd "$APP_DIR"
-source venv/bin/activate
-python main.py
+# Use osascript to launch a new Terminal window that stays open
+osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "cd '$APP_DIR' && source venv/bin/activate && python main.py; exit"
+end tell
+EOF
 EOL
         chmod +x "$SCRIPT_PATH/$APP_NAME"
         
-        # Create Info.plist
-        mkdir -p "$DESKTOP_DIR/$APP_NAME.app/Contents/Resources"
+        # Create Info.plist with proper settings
         cat > "$DESKTOP_DIR/$APP_NAME.app/Contents/Info.plist" << EOL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -421,12 +426,44 @@ EOL
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2023 Multi-Max. All rights reserved.</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
 </dict>
 </plist>
 EOL
 
+        # Create a simple shell script as an alternative method
+        cat > "$DESKTOP_DIR/Run-Multi-Max.command" << EOL
+#!/bin/bash
+cd "$APP_DIR"
+source venv/bin/activate
+python main.py
+EOL
+        chmod +x "$DESKTOP_DIR/Run-Multi-Max.command"
+
+        # Remove macOS quarantine attribute to allow app to run
+        echo -e "${YELLOW}Removing quarantine attributes (this may require your password)...${NC}"
+        xattr -dr com.apple.quarantine "$DESKTOP_DIR/$APP_NAME.app" 2>/dev/null || {
+            echo -e "${YELLOW}Failed to remove quarantine attribute automatically.${NC}"
+            echo -e "${YELLOW}If the app doesn't open, try running: sudo xattr -dr com.apple.quarantine \"$DESKTOP_DIR/$APP_NAME.app\"${NC}"
+        }
+        
+        xattr -dr com.apple.quarantine "$DESKTOP_DIR/Run-Multi-Max.command" 2>/dev/null || {
+            echo -e "${YELLOW}Failed to remove quarantine attribute from command file.${NC}"
+            echo -e "${YELLOW}If it doesn't open, try running: sudo xattr -dr com.apple.quarantine \"$DESKTOP_DIR/Run-Multi-Max.command\"${NC}"
+        }
+
         echo -e "${GREEN}Created macOS launcher at $DESKTOP_DIR/$APP_NAME.app${NC}"
-        echo -e "${YELLOW}Note: You can drag this to your Applications folder if desired${NC}"
+        echo -e "${GREEN}Also created an alternative launcher at $DESKTOP_DIR/Run-Multi-Max.command${NC}"
+        echo -e "${YELLOW}Note: If the .app doesn't work, you can double-click Run-Multi-Max.command instead${NC}"
+        echo -e "${YELLOW}Note: You can drag the .app to your Applications folder if desired${NC}"
+        echo -e "${YELLOW}Note: You may need to right-click and select 'Open' the first time due to security settings${NC}"
         
     elif [[ "$OS" == "linux" ]]; then
         echo -e "${YELLOW}Creating Linux desktop shortcut...${NC}"
