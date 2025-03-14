@@ -131,12 +131,10 @@ Write-ColorOutput "Cloning the Multi-Max repository..." "Yellow"
 $installDir = Join-Path $env:USERPROFILE "multi-max"
 if (Test-Path $installDir) {
     Write-ColorOutput "The 'multi-max' directory already exists." "Yellow"
-    $overwrite = Read-Host "Do you want to overwrite it? (y/n)"
-    if ($overwrite -eq "y" -or $overwrite -eq "Y") {
-        Remove-Item -Recurse -Force $installDir
-    } else {
-        Write-ColorOutput "Using existing directory. Note that this may cause issues if files have changed." "Yellow"
-    }
+    # Automatically overwrite existing directory for full automation
+    Write-ColorOutput "Automatically removing existing directory for fresh installation..." "Yellow"
+    Remove-Item -Recurse -Force $installDir
+    Write-ColorOutput "Existing directory removed." "Green"
 }
 
 if (-not (Test-Path $installDir)) {
@@ -350,47 +348,19 @@ FRAME_BUFFER_SIZE=60
     Write-ColorOutput "Basic .env file created." "Green"
 }
 
-# Step 12: Create desktop shortcut
-Write-ColorOutput "Would you like to create a desktop shortcut for easy launching? (y/n)" "Yellow"
-$createShortcut = Read-Host
-if ($createShortcut -eq "y" -or $createShortcut -eq "Y") {
-    Write-ColorOutput "Creating Windows shortcut..." "Yellow"
+# Step 12: Create desktop shortcut (automatic)
+Write-ColorOutput "Creating desktop shortcut for easy launching..." "Yellow"
     
-    try {
-        $WshShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\Multi-Max.lnk")
-        $Shortcut.TargetPath = "powershell.exe"
-        $Shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$installDir\run.ps1`""
-        $Shortcut.WorkingDirectory = $installDir
-        $Shortcut.Description = "Multi-Max Recursive Video Grid"
-        $Shortcut.Save()
-        
-        # Create the run script
-        @"
-# Launcher for Multi-Max
-Set-Location "$installDir"
-& .\$venvName\Scripts\Activate.ps1
-python main.py
-"@ | Set-Content "run.ps1"
-        
-        Write-ColorOutput "Desktop shortcut created successfully." "Green"
-    } catch {
-        Write-ColorOutput "Failed to create desktop shortcut: $_" "Red"
-        
-        # Create a batch file as fallback
-        @"
-@echo off
-cd "$installDir"
-call $venvName\Scripts\activate.bat
-python main.py
-"@ | Set-Content "$env:USERPROFILE\Desktop\Multi-Max.bat"
-        
-        Write-ColorOutput "Created fallback batch file at Desktop\Multi-Max.bat" "Yellow"
-    }
-} else {
-    Write-ColorOutput "Skipping desktop shortcut creation." "Yellow"
+try {
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\Multi-Max.lnk")
+    $Shortcut.TargetPath = "powershell.exe"
+    $Shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$installDir\run.ps1`""
+    $Shortcut.WorkingDirectory = $installDir
+    $Shortcut.Description = "Multi-Max Recursive Video Grid"
+    $Shortcut.Save()
     
-    # Create a run script anyway
+    # Create the run script
     @"
 # Launcher for Multi-Max
 Set-Location "$installDir"
@@ -398,7 +368,19 @@ Set-Location "$installDir"
 python main.py
 "@ | Set-Content "run.ps1"
     
-    Write-ColorOutput "Created run.ps1 script for manual execution." "Green"
+    Write-ColorOutput "Desktop shortcut created successfully." "Green"
+} catch {
+    Write-ColorOutput "Failed to create desktop shortcut: $_" "Yellow"
+    
+    # Create a batch file as fallback
+    @"
+@echo off
+cd "$installDir"
+call $venvName\Scripts\activate.bat
+python main.py
+"@ | Set-Content "$env:USERPROFILE\Desktop\Multi-Max.bat"
+    
+    Write-ColorOutput "Created fallback batch file at Desktop\Multi-Max.bat" "Green"
 }
 
 # Step 13: Installation complete
@@ -422,5 +404,21 @@ if (-not (Test-Path env:VIRTUAL_ENV)) {
     Write-ColorOutput "  .\$venvName\Scripts\Activate.ps1" "Yellow"
 }
 
-# Keep window open
-Read-Host "Press Enter to exit" 
+# Add auto-launch option
+Write-ColorOutput "Installation complete! The application will launch automatically in 5 seconds..." "Green"
+Write-ColorOutput "Press Ctrl+C now if you want to cancel the automatic launch." "Yellow"
+
+# Sleep for 5 seconds to allow reading the message
+Start-Sleep -Seconds 5
+
+# Auto-launch the application
+try {
+    Write-ColorOutput "Launching Multi-Max..." "Green"
+    & .\run.ps1
+} catch {
+    Write-ColorOutput "Failed to auto-launch. You can start the application manually by:" "Yellow"
+    Write-ColorOutput "1. Navigate to $installDir" "Yellow"
+    Write-ColorOutput "2. Run the script: .\run.ps1" "Yellow"
+    # Exit without prompting
+    exit 0
+} 
