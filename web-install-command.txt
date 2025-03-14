@@ -1,1 +1,1 @@
-powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/multi-max/multi-max/main/install-multi-max.ps1 | iex" 
+powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/dreamworks2050/multi-max/main/install-multi-max.ps1 | iex" 
