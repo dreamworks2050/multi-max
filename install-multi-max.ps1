@@ -141,15 +141,9 @@ if (Test-Path $installDir) {
 
 if (-not (Test-Path $installDir)) {
     try {
-        # Ask the user for the repository URL
-        Write-ColorOutput "Please enter the GitHub repository URL for Multi-Max:" "Yellow"
-        $repoUrl = Read-Host
-        
-        # Use default URL if none provided
-        if ([string]::IsNullOrWhiteSpace($repoUrl)) {
-            Write-ColorOutput "No URL provided, using default repository." "Yellow"
-            $repoUrl = "https://github.com/multi-max/multi-max.git"
-        }
+        # Use the hardcoded repository URL directly
+        $repoUrl = "https://github.com/dreamworks2050/multi-max.git"
+        Write-ColorOutput "Cloning from repository: $repoUrl" "Yellow"
         
         # Clone the repository
         git clone $repoUrl $installDir
@@ -159,7 +153,7 @@ if (-not (Test-Path $installDir)) {
         Write-ColorOutput "Repository cloned successfully to $installDir" "Green"
     } catch {
         Write-ColorOutput "Failed to clone repository: $_" "Red"
-        Write-ColorOutput "Please check the repository URL and your internet connection." "Red"
+        Write-ColorOutput "Please check your internet connection." "Red"
         exit 1
     }
 }
