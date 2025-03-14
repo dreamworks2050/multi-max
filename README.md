@@ -26,26 +26,63 @@ A Python application for creating recursive video grid effects with FFmpeg and O
 - Python 3.9+
 - Dependencies listed in `requirements.txt`
 
-## Installation
+## Installation Instructions
 
-For easy installation on any system, use the included installer script:
+### Windows Installation
 
-```bash
-# Make the installer executable (if needed)
-chmod +x installer.sh
+You can install Multi-Max on Windows with a single command. The installer will automatically download and install all required dependencies.
 
-# Run the installer
-./installer.sh
+#### One-Line Web Installer (Recommended)
+
+1. Open PowerShell or Command Prompt **as Administrator** (right-click and select "Run as administrator")
+2. Copy and paste the following command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/dreamworks2050/multi-max/main/install-multi-max.ps1 | iex"
 ```
 
-The installer will:
-1. Detect your operating system and hardware
-2. Install Homebrew (on macOS)
-3. Install Python
-4. Install FFmpeg
-5. Set up a Python virtual environment
-6. Install all required dependencies
-7. Configure your environment (.env file)
+3. Press Enter and follow the on-screen instructions
+
+#### What the Installer Does
+
+The Windows installer will:
+
+1. Install Chocolatey (Windows package manager) if not already installed
+2. Install Git, Python, and FFmpeg
+3. Clone this repository to your user folder
+4. Create a virtual environment named "multi-max"
+5. Install the UV package manager for faster dependency installation
+6. Install all required Python packages
+7. Configure the application
+8. Create desktop shortcuts for easy access
+
+#### Manual Installation (Alternative)
+
+If the one-line installer doesn't work, you can install manually:
+
+1. Install [Python](https://www.python.org/downloads/) (3.8 or later)
+2. Install [Git](https://git-scm.com/download/win)
+3. Install [FFmpeg](https://ffmpeg.org/download.html) and add it to your PATH
+4. Open Command Prompt as Administrator and run:
+
+```cmd
+git clone https://github.com/dreamworks2050/multi-max.git
+cd multi-max
+python -m venv multi-max
+multi-max\Scripts\activate
+pip install uv
+uv pip install -r requirements.txt
+```
+
+5. Create a .env file or copy from .env.template if available
+
+### macOS Installation
+
+For macOS users, run the installer script:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/dreamworks2050/multi-max/main/installer.sh)"
+```
 
 ## Configuration
 
@@ -160,4 +197,27 @@ For more detailed packaging instructions, see [PACKAGING.md](PACKAGING.md).
 
 ---
 
-For architecture details and technical documentation, see [ARCHITECTURE.md](ARCHITECTURE.md). 
+For architecture details and technical documentation, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Troubleshooting
+
+### Windows Installation Issues
+
+- **Execution Policy Error**: If you see errors about execution policy, try running:
+  ```powershell
+  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+  ```
+  
+- **UV Installation Fails**: If UV fails to install, the script will automatically fall back to using pip
+
+- **FFmpeg Not Found**: Ensure FFmpeg is properly installed and added to your PATH
+
+- **Virtual Environment Activation Fails**: You can manually activate the virtual environment:
+  ```cmd
+  cd %USERPROFILE%\multi-max
+  multi-max\Scripts\activate.bat
+  ```
+
+### For More Help
+
+If you encounter any issues during installation, please [open an issue](https://github.com/dreamworks2050/multi-max/issues) with details about the error. 
