@@ -1,0 +1,1 @@
+powershell -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/yourusername/multi-max/main/install-multi-max.ps1' -OutFile $env:TEMP\install-multi-max.ps1; Start-Process powershell -ArgumentList '-ExecutionPolicy Bypass -File $env:TEMP\install-multi-max.ps1' -Verb RunAs" 

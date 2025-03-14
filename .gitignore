@@ -196,3 +196,26 @@ docs/generated/
 # Temporary directories
 /tmp_*
 /temp/
+
+# Virtual Environment
+venv/
+ENV/
+.venv/
+
+# Environment variables
+.env
+
+# But keep the template
+!.env.template
+
+# Logs
+*.log
+
+# Temporary files
+*.swp
+*.swo
+
+# Media files (optional, uncomment if needed)
+# *.mp4
+# *.avi
+# *.mov

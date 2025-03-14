@@ -1,6 +1,6 @@
-# Multi-Max
+# Multi-Max: Recursive Video Grid
 
-A powerful video processing application that provides real-time infinite fractal recursion, optimized specifically for Apple Silicon (M1/M2/M3) hardware.
+A Python application for creating recursive video grid effects with FFmpeg and OpenCV.
 
 ## Features
 
@@ -28,32 +28,69 @@ A powerful video processing application that provides real-time infinite fractal
 
 ## Installation
 
-1. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/multi-max.git
-   cd multi-max
-   ```
+For easy installation on any system, use the included installer script:
 
-2. Create and activate a virtual environment:
-   ```
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
+```bash
+# Make the installer executable (if needed)
+chmod +x installer.sh
 
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+# Run the installer
+./installer.sh
+```
 
-4. Create a `.env` file in the project root and add your video source URL:
-   ```
-   YOUTUBE_URL=https://www.youtube.com/watch?v=your_video_id
-   ```
+The installer will:
+1. Detect your operating system and hardware
+2. Install Homebrew (on macOS)
+3. Install Python
+4. Install FFmpeg
+5. Set up a Python virtual environment
+6. Install all required dependencies
+7. Configure your environment (.env file)
 
-5. Run the application:
-   ```
-   python main.py
-   ```
+## Configuration
+
+The application uses a `.env` file for configuration. During installation, a default configuration is created based on your system.
+
+Key settings:
+- `FORCE_HARDWARE_ACCELERATION`: Enable/disable hardware acceleration (default: true on Apple Silicon)
+- `ALLOW_SOFTWARE_FALLBACK`: Allow fallback to software rendering (default: false on Apple Silicon)
+- `DEFAULT_VIDEO_URL`: Default YouTube URL to use
+- `LOG_LEVEL`: Logging verbosity level
+- `FRAME_BUFFER_SIZE`: Number of frames to buffer
+
+To reset your configuration to defaults, delete the `.env` file and run the installer again:
+
+```bash
+rm .env
+./installer.sh
+```
+
+## Hardware Acceleration
+
+On Apple Silicon (M1/M2/M3) Macs, hardware acceleration is enabled by default for improved performance. If you experience issues, edit the `.env` file and set:
+
+```
+FORCE_HARDWARE_ACCELERATION=false
+ALLOW_SOFTWARE_FALLBACK=true
+```
+
+## Running the Application
+
+After installation:
+
+```bash
+# Activate the virtual environment
+source venv/bin/activate
+
+# Run the application
+python main.py
+```
+
+For more options, run:
+
+```bash
+python main.py --help
+```
 
 ## Usage
 
