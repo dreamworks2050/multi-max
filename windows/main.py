@@ -136,7 +136,9 @@ def perform_auto_update():
             logging.error(f"Installer not found at {installer_path}")
             # Try to find the installer using an absolute path search
             alternate_paths = [
+                os.path.join(os.path.dirname(windows_dir), "Install-Windows.bat"),
                 os.path.join(os.path.dirname(windows_dir), "windows", "Install-Windows.bat"),
+                os.path.join(os.path.dirname(os.path.dirname(windows_dir)), "Install-Windows.bat"),
                 os.path.join(os.path.dirname(os.path.dirname(windows_dir)), "windows", "Install-Windows.bat")
             ]
             
@@ -148,30 +150,68 @@ def perform_auto_update():
                     
             if not os.path.exists(installer_path):
                 logging.error("Could not find the installer at any expected location")
+                # Just return without trying to update
                 return False
             
-        logging.info("Starting automatic update process")
+        logging.info(f"Starting automatic update process with installer: {installer_path}")
         
-        # Create and display an update notification window
+        # Create and display an update notification window using a simpler approach
         try:
+            # Initialize only the necessary components
             pygame.init()
-            info_screen = pygame.display.set_mode((600, 200))
-            pygame.display.set_caption("Multi-Max Update")
-            font = pygame.font.SysFont('Arial', 18)
+            
+            # Use a more basic approach for font creation that's less likely to fail
+            try:
+                font = pygame.font.SysFont('Arial', 18)
+                if not font:
+                    # Sometimes SysFont fails silently
+                    fonts = pygame.font.get_fonts()
+                    if fonts:
+                        font = pygame.font.SysFont(fonts[0], 18)
+                    else:
+                        # Last resort default font
+                        font = pygame.font.Font(None, 18)
+            except:
+                # If all font attempts fail, use the default font
+                font = pygame.font.Font(None, 18)
+                
+            # Create display with more error handling
+            try:
+                info_screen = pygame.display.set_mode((600, 200))
+                pygame.display.set_caption("Multi-Max Update")
+            except:
+                # Use a smaller size if the display creation fails
+                info_screen = pygame.display.set_mode((400, 150))
+                pygame.display.set_caption("Update")
             
             info_screen.fill((0, 0, 0))
-            update_text1 = font.render("A new version of Multi-Max is available!", True, (255, 255, 255))
-            update_text2 = font.render("The application will now update automatically.", True, (255, 255, 255))
-            update_text3 = font.render("Please wait a moment while the installer runs...", True, (255, 255, 255))
             
-            info_screen.blit(update_text1, (50, 50))
-            info_screen.blit(update_text2, (50, 80))
-            info_screen.blit(update_text3, (50, 110))
-            pygame.display.flip()
-            
-            # Wait a moment for the user to read the message
-            time.sleep(3)
-            
+            # Render and display text with error handling
+            try:
+                lines = [
+                    "A new version of Multi-Max is available!",
+                    "The application will now update automatically.",
+                    "Please wait while the installer runs..."
+                ]
+                
+                y_position = 50
+                for line in lines:
+                    try:
+                        text = font.render(line, True, (255, 255, 255))
+                        info_screen.blit(text, (50, y_position))
+                        y_position += 30
+                    except:
+                        # Skip any lines that fail to render
+                        pass
+                        
+                pygame.display.flip()
+                
+                # Wait a moment for the user to read the message
+                time.sleep(3)
+            except:
+                # Continue with update even if text rendering fails
+                pass
+                
             # Close pygame properly before launching the installer
             pygame.quit()
         except Exception as e:
@@ -181,17 +221,31 @@ def perform_auto_update():
         # Launch the installer in a new process and exit this one
         try:
             logging.info(f"Launching installer from: {installer_path}")
+            
+            # Use a more robust Windows-specific approach
             if platform.system() == 'Windows':
-                # Use subprocess.CREATE_NEW_CONSOLE to show a new command window for the installer
-                creation_flags = 0x00000010  # CREATE_NEW_CONSOLE
-                subprocess.Popen(['cmd.exe', '/c', 'start', '', installer_path], 
-                               creationflags=creation_flags)
+                try:
+                    # First try with the standard approach
+                    creation_flags = 0x00000010  # CREATE_NEW_CONSOLE flag
+                    subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], 
+                                   creationflags=creation_flags)
+                except:
+                    # Fall back to simpler approach if the first one fails
+                    subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], shell=True)
             else:
                 # This should never happen on Windows version
                 subprocess.Popen([installer_path], shell=True)
             
             logging.info("Update initiated. Exiting current instance.")
             time.sleep(1)  # Give the subprocess a moment to start
+            
+            # Exit cleanly
+            try:
+                pygame.quit()
+            except:
+                pass
+                
+            # Exit
             sys.exit(0)
             
         except Exception as e:
@@ -1538,41 +1592,28 @@ def main():
     fractal_cleanup_interval = 10.0
     
     try:
-        # Initialize pygame components with robust error handling
-        components_initialized = {
-            'display': False, 
-            'font': False, 
-            'event': False
-        }
-        
+        # Initialize pygame with simplified error handling for Windows compatibility
         try:
             pygame.init()
-            # Check which components were successfully initialized
-            components_initialized['display'] = pygame.display.get_init()
-            components_initialized['font'] = pygame.font.get_init()
-            components_initialized['event'] = pygame.event.get_init()
+            logging.info("Pygame initialized successfully")
         except Exception as e:
             logging.error(f"Error initializing pygame: {e}")
-            # Try to initialize individual components
+            # Try individual components that we absolutely need
             try:
-                if not components_initialized['display']:
-                    pygame.display.init()
-                    components_initialized['display'] = True
-                if not components_initialized['font']:
-                    pygame.font.init()
-                    components_initialized['font'] = True
-                if not components_initialized['event']:
-                    pygame.event.init()
-                    components_initialized['event'] = True
+                pygame.display.init()
+                logging.info("Pygame display initialized successfully")
             except Exception as e2:
-                logging.error(f"Critical error initializing pygame components: {e2}")
+                logging.error(f"Failed to initialize pygame display: {e2}")
+                return
                 
-        # Check if we have the minimum required components
-        if not components_initialized['display']:
-            logging.error("Failed to initialize pygame display. Exiting.")
-            return
-        
-        # Ensure mixer is not initialized (known to cause issues)
+            try:
+                pygame.font.init()
+                logging.info("Pygame font initialized successfully")
+            except Exception as e2:
+                logging.warning(f"Failed to initialize pygame font: {e2}")
+                # Continue without fonts, we'll handle this later
+                
+        # Try to quit mixer to avoid sound issues (commonly causes problems)
         try:
             pygame.mixer.quit()
         except:
@@ -1589,17 +1630,35 @@ def main():
             return
         
         # Continue with normal initialization
-        pygame.mixer.quit()
         pygame.display.set_caption("MultiMax Grid")
-        display_info = pygame.display.Info()
-        screen_width = min(1280, display_info.current_w - 100)
-        screen_height = min(720, display_info.current_h - 100)
-        screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
         
+        try:
+            display_info = pygame.display.Info()
+            screen_width = min(1280, display_info.current_w - 100)
+            screen_height = min(720, display_info.current_h - 100)
+        except:
+            # Fallback if display info fails
+            screen_width = 1280
+            screen_height = 720
+            
+        try:
+            screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+            logging.info(f"Display initialized with size: {screen_width}x{screen_height}")
+        except Exception as e:
+            logging.error(f"Failed to create display: {e}")
+            try:
+                # Fallback to a smaller size
+                screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
+                screen_width, screen_height = 800, 600
+                logging.info("Falling back to 800x600 display")
+            except Exception as e2:
+                logging.error(f"Critical display error: {e2}")
+                return
+                
         # Calculate initial display rectangle
         frame_display_rect = calculate_display_rect(screen_width, screen_height)
         
-        screen.fill((255, 255, 255))
+        screen.fill((0, 0, 0))  # Use black background instead of white
         pygame.display.flip()
         
         # Set up signal handlers for graceful termination
@@ -1689,13 +1748,64 @@ def main():
         screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
         pygame.display.set_caption("Recursive Grid Livestream")
         clock = pygame.time.Clock()
-        font = pygame.font.SysFont("Arial", 24)
         
-        screen.fill((255, 255, 255))
-        loading_text = font.render("Loading Video...", True, (0, 0, 0))
-        screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2, screen.get_height() // 2 - loading_text.get_height() // 2))
+        # Improve font creation to be more robust
+        try:
+            font = pygame.font.SysFont("Arial", 24)
+            # Quick test to see if font works
+            test_text = font.render("Test", True, (255, 255, 255))
+        except Exception as e:
+            logging.warning(f"Could not create Arial font: {e}")
+            try:
+                # Try available system fonts
+                available_fonts = pygame.font.get_fonts()
+                if available_fonts:
+                    for test_font in available_fonts[:3]:  # Try the first few fonts
+                        try:
+                            font = pygame.font.SysFont(test_font, 24)
+                            test_text = font.render("Test", True, (255, 255, 255))
+                            logging.info(f"Using alternative font: {test_font}")
+                            break
+                        except:
+                            continue
+                    else:  # This runs if no font in the loop worked
+                        raise Exception("No system fonts worked")
+                else:
+                    raise Exception("No system fonts available")
+            except Exception as e2:
+                logging.error(f"Could not create any system font: {e2}")
+                # Last resort
+                try:
+                    font = pygame.font.Font(None, 24)  # Default pygame font
+                    logging.info("Using pygame default font")
+                except:
+                    logging.error("Critical: All font creation methods failed")
+                    # Continue without a font - we'll handle rendering carefully
+        
+        screen.fill((0, 0, 0))
+        
+        # Draw loading message with extra error checking
+        try:
+            if font:
+                loading_text = font.render("Loading Video...", True, (255, 255, 255))
+                center_x = screen.get_width() // 2 - loading_text.get_width() // 2
+                center_y = screen.get_height() // 2 - loading_text.get_height() // 2
+                screen.blit(loading_text, (center_x, center_y))
+            else:
+                # Fallback if no font
+                pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                         screen.get_height() // 2 - 10, 200, 20))
+        except Exception as e:
+            logging.error(f"Error drawing loading text: {e}")
+            # Just show a white rectangle as a visual indicator
+            try:
+                pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                         screen.get_height() // 2 - 10, 200, 20))
+            except:
+                pass
+                
         pygame.display.flip()
-
+        
         stream_url = get_stream_url(args.youtube_url)
         if not stream_url:
             logging.error(f"Failed to get stream URL for {args.youtube_url}")
@@ -1712,12 +1822,41 @@ def main():
                 logging.error("Could not get any valid stream URL, exiting")
                 return
 
-        screen.fill((255, 255, 255))
-        connecting_text = font.render("Connecting to Video Stream...", True, (0, 0, 0))
-        please_wait_text = font.render("Please wait...", True, (0, 0, 0))
-        screen.blit(connecting_text, (screen.get_width() // 2 - connecting_text.get_width() // 2, screen.get_height() // 2 - connecting_text.get_height() // 2))
-        screen.blit(please_wait_text, (screen.get_width() // 2 - please_wait_text.get_width() // 2, screen.get_height() // 2 + 30))
-        pygame.display.flip()
+        # Update the display with connecting message, with robust error handling
+        try:
+            screen.fill((0, 0, 0))
+            
+            try:
+                if font:
+                    # First line
+                    connecting_text = font.render("Connecting to Video Stream...", True, (255, 255, 255))
+                    center_x = screen.get_width() // 2 - connecting_text.get_width() // 2
+                    center_y = screen.get_height() // 2 - connecting_text.get_height()
+                    screen.blit(connecting_text, (center_x, center_y))
+                    
+                    # Second line
+                    please_wait_text = font.render("Please wait...", True, (255, 255, 255))
+                    center_x = screen.get_width() // 2 - please_wait_text.get_width() // 2
+                    center_y = screen.get_height() // 2 + 30
+                    screen.blit(please_wait_text, (center_x, center_y))
+                else:
+                    # Visual indicator if no font
+                    pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                             screen.get_height() // 2 - 10, 200, 5))
+                    pygame.draw.rect(screen, (200, 200, 200), (screen.get_width() // 2 - 50, 
+                                                             screen.get_height() // 2 + 15, 100, 5))
+            except Exception as text_error:
+                logging.error(f"Error rendering connecting text: {text_error}")
+                # Fallback visual indicator
+                try:
+                    pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                             screen.get_height() // 2 - 10, 200, 5))
+                except:
+                    pass
+                    
+            pygame.display.flip()
+        except Exception as e:
+            logging.error(f"Error updating connecting screen: {e}")
 
         logging.info(f"Initializing video capture for stream: {stream_url}")
         cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
@@ -1754,19 +1893,61 @@ def main():
         total_process_time = 0
         frame_counter = 0
 
+        # Buffer waiting loop with improved robustness
         buffer_wait_start = time.time()
         buffer_wait_timeout = 5.0
+        dots = 0
+        
         while time.time() - buffer_wait_start < buffer_wait_timeout:
             if frame_buffer is not None and not frame_buffer.empty():
                 logging.info(f"Buffer started filling after {time.time() - buffer_wait_start:.1f} seconds")
                 break
+                
+            # Update dots animation
+            dots = (dots + 1) % 4
+            dots_str = "." * dots
+            elapsed = int(time.time() - buffer_wait_start)
+            
             time.sleep(0.1)
-            screen.fill((0, 0, 0))
-            if font is None:
-                font = pygame.font.SysFont('Arial', 24)
-            loading_text = font.render(f"Loading stream... ({int(time.time() - buffer_wait_start)}s)", True, (255, 255, 255))
-            screen.blit(loading_text, (screen.get_width() // 2 - loading_text.get_width() // 2, screen.get_height() // 2 - loading_text.get_height() // 2))
-            pygame.display.flip()
+            
+            try:
+                screen.fill((0, 0, 0))
+                
+                try:
+                    if font:
+                        loading_message = f"Loading stream{dots_str} ({elapsed}s)"
+                        loading_text = font.render(loading_message, True, (255, 255, 255))
+                        center_x = screen.get_width() // 2 - loading_text.get_width() // 2
+                        center_y = screen.get_height() // 2 - loading_text.get_height() // 2
+                        screen.blit(loading_text, (center_x, center_y))
+                    else:
+                        # Visual progress indicator if no font
+                        progress = min(elapsed / buffer_wait_timeout, 1.0)
+                        width = int(200 * progress)
+                        pygame.draw.rect(screen, (100, 100, 100), (screen.get_width() // 2 - 100, 
+                                                                 screen.get_height() // 2 - 10, 200, 20))
+                        pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                                 screen.get_height() // 2 - 10, width, 20))
+                except Exception as text_error:
+                    # Last resort visual indicator
+                    try:
+                        progress = min(elapsed / buffer_wait_timeout, 1.0)
+                        width = int(200 * progress)
+                        pygame.draw.rect(screen, (100, 100, 100), (screen.get_width() // 2 - 100, 
+                                                                 screen.get_height() // 2 - 10, 200, 20))
+                        pygame.draw.rect(screen, (255, 255, 255), (screen.get_width() // 2 - 100, 
+                                                                 screen.get_height() // 2 - 10, width, 20))
+                    except:
+                        pass
+                
+                # Try to update the display
+                try:
+                    pygame.display.flip()
+                except Exception as flip_error:
+                    logging.error(f"Failed to update display: {flip_error}")
+                
+            except Exception as outer_error:
+                logging.error(f"Error in buffer wait loop: {outer_error}")
 
         while running:
             current_time = time.time()
