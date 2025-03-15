@@ -8,6 +8,7 @@ import signal
 import platform
 import argparse
 import os
+import atexit
 from dotenv import load_dotenv
 import traceback
 import gc
@@ -153,7 +154,7 @@ def refresh_youtube_url(original_url):
 def start_frame_reader_thread(video_source, stream_url, original_youtube_url, buffer_size=60):
     """Start a background thread to read frames from the video source."""
     global frame_buffer, frame_buffer_lock, frame_reader_thread, should_stop_frame_reader
-    global current_stream_url, frame_drop_threshold, last_url_refresh_time
+    global current_stream_url, last_url_refresh_time
     
     current_stream_url = stream_url
     last_url_refresh_time = time.time()
@@ -435,6 +436,8 @@ prev_output_frame = None
 fractal_depth = 1
 is_fullscreen = False  # Track fullscreen state
 window_size = (1280, 720)  # Store original window size
+frame_display_rect = None  # Rectangle for preserving aspect ratio
+ASPECT_RATIO = 16/9  # Standard 16:9 aspect ratio for videos
 
 # Stats
 frame_count = 0
@@ -510,10 +513,38 @@ def compute_fractal_depth(live_frame, depth):
         prev = compute_fractal_depth(live_frame, depth - 1)
         return create_fractal_grid(live_frame, prev, 2, 3)
 
+def calculate_display_rect(screen_width, screen_height, aspect_ratio=None):
+    """
+    Calculate the largest rectangle with the given aspect ratio that fits in the screen.
+    Returns (x, y, width, height) for positioning the frame centered on screen with letterbox/pillarbox as needed.
+    """
+    if aspect_ratio is None:
+        aspect_ratio = ASPECT_RATIO
+        
+    screen_aspect = screen_width / screen_height
+    
+    # Allow a small tolerance (e.g., if screen is 16:10 but close enough to 16:9)
+    if abs(screen_aspect - aspect_ratio) < 0.05:
+        # If screen is already very close to 16:9, use full screen
+        return (0, 0, screen_width, screen_height)
+    
+    if screen_aspect > aspect_ratio:
+        # Screen is wider than 16:9 - pillarbox (black bars on sides)
+        display_height = screen_height
+        display_width = int(display_height * aspect_ratio)
+        x_offset = (screen_width - display_width) // 2
+        return (x_offset, 0, display_width, display_height)
+    else:
+        # Screen is taller than 16:9 - letterbox (black bars on top/bottom)
+        display_width = screen_width
+        display_height = int(display_width / aspect_ratio)
+        y_offset = (screen_height - display_height) // 2
+        return (0, y_offset, display_width, display_height)
+
 def handle_keyboard_event(key_name, mod=None):
     """Handle keyboard inputs for adjusting settings."""
     global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug
-    global fractal_source_position, fractal_depth, prev_frames, is_fullscreen, window_size, screen
+    global fractal_source_position, fractal_depth, prev_frames, is_fullscreen, window_size, screen, frame_display_rect
 
     old_grid_size = grid_size
     old_depth = depth
@@ -526,12 +557,23 @@ def handle_keyboard_event(key_name, mod=None):
         if key_name == 'w':
             is_fullscreen = not is_fullscreen
             if is_fullscreen:
-                window_size = screen.get_size()  # Save current window size
+                # Store current window position and size before switching
+                window_size = screen.get_size()
+                
+                # Switch to fullscreen
                 screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-                logging.info("Full screen mode enabled")
+                
+                # Precalculate display rectangle for aspect ratio preservation
+                display_info = pygame.display.Info()
+                frame_display_rect = calculate_display_rect(display_info.current_w, display_info.current_h)
+                
+                logging.info(f"Full screen mode enabled with display area: {frame_display_rect}")
             else:
+                # Return to windowed mode with the original size
                 screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
-                logging.info("Window mode enabled")
+                # Calculate aspect ratio preserving rect for window mode as well
+                frame_display_rect = calculate_display_rect(window_size[0], window_size[1])
+                logging.info(f"Window mode enabled with size: {window_size}")
         
         elif key_name == '4' and mode == "fractal" and (not mod or not (mod & pygame.KMOD_SHIFT)):
             mode = "fractal_depth"
@@ -937,7 +979,12 @@ def calculate_visible_screens(fractal_grid_size, frame_width, frame_height):
     visible_screens = 0
     
     one_pixel_level = np.log(min_dim) / np.log(fractal_grid_size)
-    exact_pixel_level = int(np.floor(one_pixel_level)) if abs(min_dim / (fractal_grid_size ** int(np.floor(one_pixel_level))) - 1.0) < abs(min_dim / (fractal_grid_size ** int(np.ceil(one_pixel_level))) - 1.0) else int(np.ceil(one_pixel_level))
+    # Calculate which level has closest to 1px cells
+    floor_level = int(np.floor(one_pixel_level))
+    ceil_level = int(np.ceil(one_pixel_level))
+    floor_diff = abs(min_dim / (fractal_grid_size ** floor_level) - 1.0)
+    ceil_diff = abs(min_dim / (fractal_grid_size ** ceil_level) - 1.0)
+    exact_pixel_level = floor_level if floor_diff < ceil_diff else ceil_level
     
     for k in range(max_level + 1):
         screens_at_level = r ** k
@@ -972,13 +1019,61 @@ def calculate_visible_recursive_cells(fractal_grid_size, frame_width, frame_heig
     
     return visible_recursive_cells
 
+def shutdown_application():
+    """Perform a graceful shutdown, cleaning up all resources."""
+    global running, frame_reader_thread, should_stop_frame_reader, cap, screen
+    
+    logging.info("Performing graceful shutdown...")
+    
+    # Stop the main loop
+    running = False
+    
+    # Stop the frame reader thread
+    if frame_reader_thread is not None and frame_reader_thread.is_alive():
+        logging.info("Shutting down frame reader thread...")
+        should_stop_frame_reader = True
+        try:
+            frame_reader_thread.join(timeout=3.0)
+            if frame_reader_thread.is_alive():
+                logging.warning("Frame reader thread did not terminate within timeout")
+        except Exception as e:
+            logging.error(f"Error while stopping frame reader thread: {e}")
+    
+    # Release video capture resources
+    if 'cap' in globals() and cap is not None:
+        try:
+            logging.info("Releasing video capture resources...")
+            cap.release()
+        except Exception as e:
+            logging.error(f"Error while releasing video capture: {e}")
+    
+    # Clean up pygame resources
+    try:
+        logging.info("Cleaning up pygame resources...")
+        pygame.mixer.quit()
+        pygame.quit()
+    except Exception as e:
+        logging.error(f"Error while quitting pygame: {e}")
+    
+    # Final garbage collection
+    try:
+        logging.info("Performing final memory cleanup...")
+        gc.collect()
+    except Exception as e:
+        logging.error(f"Error during final garbage collection: {e}")
+    
+    logging.info("Shutdown complete. Goodbye!")
+
 def main():
     """Main function for Windows-compatible video processing."""
     global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
     global hardware_acceleration_available, cap, mode, fractal_grid_size, fractal_debug, fractal_source_position, prev_output_frame
     global enable_memory_tracing, fractal_depth, current_stream_url, last_buffer_warning_time, frame_drop_threshold
     global key_pressed, key_press_start, key_last_repeat, last_url_refresh_time, stream_url_refresh_interval, prev_frames
-    global is_fullscreen, window_size, screen
+    global is_fullscreen, window_size, screen, frame_display_rect, ASPECT_RATIO
+    
+    # Register clean shutdown with atexit
+    atexit.register(shutdown_application)
     
     key_pressed = {}
     key_press_start = {}
@@ -1004,12 +1099,16 @@ def main():
         screen_height = min(720, display_info.current_h - 100)
         screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
         
+        # Calculate initial display rectangle
+        frame_display_rect = calculate_display_rect(screen_width, screen_height)
+        
         screen.fill((255, 255, 255))
         pygame.display.flip()
         
+        # Set up signal handlers for graceful termination
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         load_dotenv()
         youtube_url = os.getenv('YOUTUBE_URL', "https://www.youtube.com/watch?v=ZzWBpGwKoaI")
         if not os.getenv('YOUTUBE_URL'):
@@ -1125,8 +1224,14 @@ def main():
             frame_start_time = time.time()
 
             for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                if event.type == pygame.QUIT:
+                    logging.info("Window close event detected, initiating shutdown...")
                     running = False
+                    break
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    logging.info("Escape key pressed, initiating shutdown...")
+                    running = False
+                    break
                 elif event.type == pygame.KEYDOWN:
                     key = pygame.key.name(event.key)
                     mod = event.mod
@@ -1141,6 +1246,14 @@ def main():
                     if key in ['up', 'down']:
                         key_pressed[key] = False
                         key_last_repeat.pop(key, None)
+                elif event.type == pygame.VIDEORESIZE:
+                    # Handle window resize events
+                    if not is_fullscreen:
+                        window_size = (event.w, event.h)
+                        screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
+                        # Recalculate the display rectangle
+                        frame_display_rect = calculate_display_rect(event.w, event.h)
+                        logging.debug(f"Window resized to {window_size}, display area: {frame_display_rect}")
 
             for key in ['up', 'down']:
                 if key_pressed.get(key, False):
@@ -1219,8 +1332,20 @@ def main():
                 rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
                 rgb_frame_swapped = rgb_frame.swapaxes(0, 1)
                 pygame.surfarray.blit_array(frame_surface, rgb_frame_swapped)
-                scaled_surface = pygame.transform.scale(frame_surface, screen.get_size())
-                screen.blit(scaled_surface, (0, 0))
+                
+                # Handle display based on fullscreen status
+                screen.fill((0, 0, 0))  # Fill with black for letterboxing/pillarboxing
+                
+                if frame_display_rect:
+                    # Use calculated display rectangle to maintain aspect ratio
+                    x, y, width, height = frame_display_rect
+                    scaled_surface = pygame.transform.scale(frame_surface, (width, height))
+                    screen.blit(scaled_surface, (x, y))
+                else:
+                    # Fallback - should not normally reach here
+                    scaled_surface = pygame.transform.scale(frame_surface, screen.get_size())
+                    screen.blit(scaled_surface, (0, 0))
+                
                 displayed_count += 1
                 
                 if frame_count % 10 == 0:
@@ -1382,25 +1507,23 @@ def main():
             if frame_processing_time < target_frame_time:
                 time.sleep(target_frame_time - frame_processing_time)
 
-        logging.info("Shutting down frame reader thread...")
-        stop_frame_reader_thread()
-        cap.release()
-        pygame.quit()
-        logging.info("Shutdown complete")
+        logging.info("Main loop exited, beginning cleanup...")
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt detected")
     except Exception as e:
         logging.error(f"Main function crashed: {e}\n{traceback.format_exc()}")
     finally:
-        if cap is not None:
-            cap.release()
-        for var in ['frame', 'processed_frame', 'frame_surface', 'screen', 'font']:
-            if var in locals() and locals()[var] is not None:
-                locals()[var] = None
-        pygame.quit()
-        gc.collect()
-        logging.info("Shutdown complete")
+        # Perform cleanup
+        shutdown_application()
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         logging.error(f"Program crashed: {e}\n{traceback.format_exc()}")
+        # Ensure shutdown happens even after uncaught exceptions
+        if 'shutdown_application' in globals():
+            try:
+                shutdown_application()
+            except:
+                pass
