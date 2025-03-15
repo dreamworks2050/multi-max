@@ -143,45 +143,11 @@ def versions_need_update(local_version, remote_version):
         return False
 
 def perform_auto_update():
-    """Trigger the automatic update process."""
+    """Trigger the complete auto update process that wipes and reinstalls everything."""
     try:
-        # Find the installer - check multiple possible locations
-        windows_dir = os.path.dirname(os.path.abspath(__file__))
-        parent_dir = os.path.dirname(windows_dir)
+        logging.info("Starting complete reinstallation update process...")
         
-        # Possible locations for the installer
-        installer_locations = [
-            # In the windows directory
-            os.path.join(windows_dir, "Install-Windows.bat"),
-            # In the parent directory 
-            os.path.join(parent_dir, "Install-Windows.bat"),
-            # In the parent directory as a different name
-            os.path.join(parent_dir, "install.bat"),
-            # In a windows subfolder of parent
-            os.path.join(parent_dir, "windows", "Install-Windows.bat")
-        ]
-        
-        # Log all potential paths for debugging
-        logging.info("Searching for installer in the following locations:")
-        for loc in installer_locations:
-            logging.info(f"- {loc} {'(FOUND)' if os.path.exists(loc) else '(NOT FOUND)'}")
-        
-        # Find the first valid installer path
-        installer_path = None
-        for path in installer_locations:
-            if os.path.exists(path):
-                installer_path = path
-                logging.info(f"Found installer at: {installer_path}")
-                break
-                
-        if not installer_path:
-            logging.error("Could not find the installer at any expected location")
-            # Just return without trying to update
-            return False
-            
-        logging.info(f"Starting automatic update process with installer: {installer_path}")
-        
-        # Create and display an update notification window using a simpler approach
+        # Create and display an update notification window
         try:
             # Initialize only the necessary components
             pygame.init()
@@ -217,8 +183,8 @@ def perform_auto_update():
                 lines = [
                     "A new version of Multi-Max is available!",
                     "The application will now update automatically.",
-                    "Please wait while the installer runs...",
-                    f"Installer: {os.path.basename(installer_path)}"
+                    "This process will completely reinstall Multi-Max.",
+                    "Please be patient and do not close any windows that appear."
                 ]
                 
                 y_position = 50
@@ -239,44 +205,33 @@ def perform_auto_update():
                 # Continue with update even if text rendering fails
                 pass
                 
-            # Close pygame properly before launching the installer
+            # Close pygame properly before launching the updater
             pygame.quit()
         except Exception as e:
             logging.error(f"Error showing update notification: {e}")
             # Continue with update even if notification fails
-            
-        # Launch the installer in a new process and exit this one
+        
+        # Import the update module from the windows directory
         try:
-            logging.info(f"Launching installer from: {installer_path}")
-            
-            # Use a more robust Windows-specific approach
-            if platform.system() == 'Windows':
-                try:
-                    # First try with the cleaner approach
-                    subprocess.Popen([installer_path], shell=True)
-                except Exception as e1:
-                    logging.warning(f"First installer launch attempt failed: {e1}")
-                    try:
-                        # Second approach with cmd
-                        subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], shell=True)
-                    except Exception as e2:
-                        logging.warning(f"Second installer launch attempt failed: {e2}")
-                        # Final fallback with direct cmd string
-                        cmd = f'cmd.exe /c start "" "{installer_path}"'
-                        subprocess.Popen(cmd, shell=True)
-            else:
-                # This should never happen on Windows version
-                subprocess.Popen([installer_path], shell=True)
-            
-            logging.info("Update initiated. Exiting current instance.")
-            time.sleep(1)  # Give the subprocess a moment to start
-            
-            # Write a marker file to indicate we've attempted an update
+            # Use a relative import first
+            from . import update
+        except (ImportError, ValueError):
+            # If that fails, try a direct import after adding the windows dir to path
+            windows_dir = os.path.dirname(os.path.abspath(__file__))
+            if windows_dir not in sys.path:
+                sys.path.append(windows_dir)
             try:
-                with open(os.path.join(windows_dir, "update_attempted.txt"), 'w') as f:
-                    f.write(f"Update attempted at {time.ctime()}\nFrom version: {get_local_version()}\nInstaller: {installer_path}")
-            except Exception as marker_error:
-                logging.warning(f"Could not write update marker file: {marker_error}")
+                import update
+            except ImportError:
+                logging.error("Failed to import update module")
+                return False
+        
+        # Start the update process using the update module
+        if update.start_update_process():
+            logging.info("Update process initiated successfully. Exiting current instance.")
+            
+            # Sleep briefly to allow the update process to start
+            time.sleep(1)
             
             # Exit cleanly
             try:
@@ -284,14 +239,13 @@ def perform_auto_update():
             except:
                 pass
                 
-            # Exit
+            # Exit with success code
             sys.exit(0)
-            
-        except Exception as e:
-            logging.error(f"Error launching installer: {e}")
-            logging.error(traceback.format_exc())
+            return True
+        else:
+            logging.error("Failed to start update process")
             return False
-        
+            
     except Exception as e:
         logging.error(f"Failed to perform automatic update: {e}")
         logging.error(traceback.format_exc())
