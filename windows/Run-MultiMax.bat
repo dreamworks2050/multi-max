@@ -22,9 +22,14 @@ pushd "%~dp0"
 set "SCRIPT_DIR=%CD%"
 set "PARENT_DIR=%CD%\.."
 
+:: Add script directory to PYTHONPATH to ensure update_checker can be found
+set "PYTHONPATH=%SCRIPT_DIR%;%PYTHONPATH%"
+
 :: Process command line arguments
 set SKIP_UPDATE_CHECK=0
 set ADDITIONAL_ARGS=
+set FORCE_UPDATE=0
+set RUN_UPDATER_ONLY=0
 
 :process_args
 if "%~1"=="" goto :continue_startup
@@ -32,28 +37,46 @@ if /i "%~1"=="--skip-update-check" (
     set SKIP_UPDATE_CHECK=1
     shift
     goto :process_args
+) else if /i "%~1"=="--force-update" (
+    set FORCE_UPDATE=1
+    shift
+    goto :process_args
 ) else if /i "%~1"=="--version" (
     echo Checking Multi-Max version...
-    python -c "import sys; sys.path.append('%SCRIPT_DIR%'); from update_checker import VERSION; print(f'Multi-Max (Windows) version {VERSION}')"
+    python -c "import sys; sys.path.append(r'%SCRIPT_DIR%'); from update_checker import VERSION; print(f'Multi-Max (Windows) version {VERSION}')"
     popd
     exit /b 0
 ) else if /i "%~1"=="--update" (
     echo Checking for updates...
-    python "%SCRIPT_DIR%\update_checker.py"
+    set RUN_UPDATER_ONLY=1
+    python "%SCRIPT_DIR%\update_checker.py" --auto-update
     
-    if %ERRORLEVEL% NEQ 0 (
+    if %ERRORLEVEL% EQU 100 (
+        echo.
+        echo Update was successful. Please restart Multi-Max to use the new version.
+        popd
+        pause
+        exit /b 0
+    ) else if %ERRORLEVEL% NEQ 0 (
         echo Update check failed. Please check your internet connection.
     )
     
-    echo.
-    echo Would you like to continue launching Multi-Max? (Y/N)
-    set /p continue_after_update=
-    if /i "!continue_after_update!"=="N" (
-        popd
-        exit /b 0
+    if "%~2"=="" (
+        echo.
+        echo Would you like to continue launching Multi-Max? (Y/N)
+        set /p continue_after_update=
+        if /i "!continue_after_update!"=="N" (
+            popd
+            exit /b 0
+        )
     )
     shift
     goto :process_args
+) else if /i "%~1"=="--debug-updater" (
+    echo Running update checker diagnostics...
+    call "%SCRIPT_DIR%\debug_update.bat"
+    popd
+    exit /b 0
 ) else (
     set ADDITIONAL_ARGS=!ADDITIONAL_ARGS! %1
     shift
@@ -106,6 +129,19 @@ if %ERRORLEVEL% NEQ 0 (
         exit /b 1
     )
     echo.
+)
+
+:: Check if update_checker.py exists
+if not exist "%SCRIPT_DIR%\update_checker.py" (
+    echo WARNING: update_checker.py not found. Update checks will be disabled.
+    set SKIP_UPDATE_CHECK=1
+    echo.
+)
+
+:: Create logs directory if it doesn't exist
+if not exist "%PARENT_DIR%\logs" (
+    echo Creating logs directory...
+    mkdir "%PARENT_DIR%\logs"
 )
 
 :: Run the version check to ensure we have the Windows version
@@ -170,6 +206,9 @@ set "log_file=%log_file: =0%"
 set "COMMAND_LINE=python main.py"
 if %SKIP_UPDATE_CHECK% EQU 1 (
     set "COMMAND_LINE=%COMMAND_LINE% --skip-update-check"
+)
+if %FORCE_UPDATE% EQU 1 (
+    set "COMMAND_LINE=%COMMAND_LINE% --force-update"
 )
 if not "%ADDITIONAL_ARGS%"=="" (
     set "COMMAND_LINE=%COMMAND_LINE% %ADDITIONAL_ARGS%"
@@ -236,10 +275,16 @@ if exist "multi-max\Scripts\activate.bat" (
 )
 
 echo.
-if %ERRORLEVEL_SAVED% NEQ 0 (
+if %ERRORLEVEL_SAVED% EQU 100 (
+    echo Multi-Max has been updated.
+    echo Please restart the application to use the new version.
+) else if %ERRORLEVEL_SAVED% NEQ 0 (
     echo Multi-Max encountered an error while running.
     echo Please check the error messages above or in the log file:
     echo %log_file%
+    echo.
+    echo If you're having issues with the update checker, run:
+    echo   Run-MultiMax.bat --debug-updater
 ) else (
     echo Multi-Max has exited normally.
     echo Log file saved to: %log_file%

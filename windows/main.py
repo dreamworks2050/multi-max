@@ -7,6 +7,9 @@ This script serves as the entry point for the Windows version of Multi-Max.
 It performs platform-specific checks and launches the main application.
 """
 
+# Windows-specific version marker - DO NOT REMOVE - used by installer to verify correct version
+__windows_specific_version__ = True
+
 import os
 import sys
 import time
@@ -32,16 +35,33 @@ logging.basicConfig(
 
 logger = logging.getLogger('multimax_windows')
 
+# Version for when update_checker is not available
+VERSION = "1.0.0"
+
 # Try to import the update checker
 UPDATE_CHECKER_AVAILABLE = False
 try:
+    # Add the current directory to the path to ensure update_checker can be found
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
+    # Now try to import
     from update_checker import check_for_updates, display_update_message, VERSION
     UPDATE_CHECKER_AVAILABLE = True
     logger.info(f"Update checker available. Current version: {VERSION}")
 except ImportError as e:
     logger.warning(f"Update checker not available: {e}")
-    # Define VERSION for use if update_checker is not available
-    VERSION = "1.0.0"
+    # Try an alternate method to import update_checker
+    try:
+        windows_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'windows')
+        if os.path.exists(os.path.join(windows_dir, 'update_checker.py')):
+            sys.path.append(windows_dir)
+            from update_checker import check_for_updates, display_update_message, VERSION
+            UPDATE_CHECKER_AVAILABLE = True
+            logger.info(f"Update checker available (alternate path). Current version: {VERSION}")
+    except ImportError as e2:
+        logger.warning(f"Update checker still not available after trying alternate path: {e2}")
 
 def check_windows_environment():
     """Check if running on Windows and verify system compatibility."""
@@ -177,13 +197,40 @@ def main():
             return 100  # Special exit code indicating update was performed
     
     # Get parent directory to find main.py
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.abspath(__file__)
+    windows_dir = os.path.dirname(script_path)
+    parent_dir = os.path.dirname(windows_dir)
     main_script = os.path.join(parent_dir, 'main.py')
+    
+    logger.info(f"Script path: {script_path}")
+    logger.info(f"Windows directory: {windows_dir}")
+    logger.info(f"Parent directory: {parent_dir}")
+    logger.info(f"Looking for main script at: {main_script}")
     
     if not os.path.exists(main_script):
         logger.error(f"Main script not found: {main_script}")
         print(f"ERROR: Main script not found: {main_script}")
         print("Multi-Max may not be installed correctly.")
+        
+        # Additional error info to help diagnose
+        print("\nDebugging information:")
+        print(f"Current directory: {os.getcwd()}")
+        print(f"__file__: {__file__}")
+        print(f"Script path: {script_path}")
+        print(f"Windows directory: {windows_dir}")
+        print(f"Parent directory: {parent_dir}")
+        print(f"Checking if windows dir exists: {os.path.exists(windows_dir)}")
+        print(f"Checking if parent dir exists: {os.path.exists(parent_dir)}")
+        
+        # List files in parent dir to help diagnose
+        try:
+            parent_files = os.listdir(parent_dir)
+            print(f"\nFiles in parent directory ({parent_dir}):")
+            for f in parent_files:
+                print(f"  - {f}")
+        except Exception as e:
+            print(f"Could not list files in parent directory: {e}")
+            
         return 1
     
     # Build command line for main.py
