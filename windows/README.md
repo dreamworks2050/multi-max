@@ -144,4 +144,75 @@ When contributing code that should work on both platforms:
 2. Place Windows-specific code under: `if platform.system() == 'Windows'`
 3. Add any new dependencies to both requirements.txt files
 4. Use cross-platform path handling with `os.path.join()` instead of string concatenation
-5. Use forward slashes in paths to ensure cross-platform compatibility 
+5. Use forward slashes in paths to ensure cross-platform compatibility
+
+## Update Mechanism
+
+Multi-Max includes an automatic update feature that checks for updates when the application starts. This ensures you're always running the latest version with all bug fixes and new features.
+
+### How It Works
+
+1. **Automatic Update Check**: Each time you start Multi-Max, it checks if a newer version is available in the GitHub repository.
+2. **Version Comparison**: The local version is compared with the remote version to determine if an update is needed.
+3. **Automatic Updates**: If a newer version is found, Multi-Max can automatically update itself.
+4. **Restart Required**: After an update, you'll need to restart the application to use the new version.
+
+### Command Line Options
+
+The following command line options are available for controlling the update process:
+
+- `--skip-update-check`: Skip checking for updates at startup
+- `--force-update`: Force an update check and automatically update if available
+- `--version`: Display the current version information and exit
+- `--update`: Run the update checker directly (via Run-MultiMax.bat)
+
+### Manual Update
+
+You can manually trigger an update check by running:
+
+```
+Run-MultiMax.bat --update
+```
+
+### Update Configuration
+
+Multi-Max's update behavior is designed to be non-intrusive:
+
+1. It only checks for updates on the `main` or `master` branch
+2. Updates are only performed when explicitly requested or when auto-update is enabled
+3. Local changes are preserved using git stash before updating
+
+## Version Information
+
+The version number follows [Semantic Versioning](https://semver.org/) format: `MAJOR.MINOR.PATCH`
+
+- **MAJOR**: Incremented for incompatible API changes
+- **MINOR**: Incremented for new features in a backward-compatible manner
+- **PATCH**: Incremented for backward-compatible bug fixes
+
+The current version is defined in:
+1. `VERSION` file in the root directory
+2. `windows/update_checker.py` - contains both VERSION and BUILD_DATE
+
+## Troubleshooting
+
+If you encounter issues with the update process:
+
+1. **Failed Updates**: If an update fails, check your internet connection and ensure you have write permissions to the application directory.
+2. **Offline Use**: Use the `--skip-update-check` flag to bypass update checking when you're offline.
+3. **Manual Update**: If automatic updates fail, you can manually pull the latest changes using Git:
+   ```
+   git pull origin main
+   ```
+4. **Logs**: Check the log files in the `logs` directory for detailed information about update attempts.
+
+## For Developers
+
+When releasing a new version:
+
+1. Update the `VERSION` file in the root directory
+2. Update the `VERSION` and `BUILD_DATE` in `windows/update_checker.py`
+3. Commit these changes with a message like "Bump version to X.Y.Z"
+4. Push the changes to the main branch
+
+Users will receive the update when they next start Multi-Max. 

@@ -22,6 +22,46 @@ pushd "%~dp0"
 set "SCRIPT_DIR=%CD%"
 set "PARENT_DIR=%CD%\.."
 
+:: Process command line arguments
+set SKIP_UPDATE_CHECK=0
+set ADDITIONAL_ARGS=
+
+:process_args
+if "%~1"=="" goto :continue_startup
+if /i "%~1"=="--skip-update-check" (
+    set SKIP_UPDATE_CHECK=1
+    shift
+    goto :process_args
+) else if /i "%~1"=="--version" (
+    echo Checking Multi-Max version...
+    python -c "import sys; sys.path.append('%SCRIPT_DIR%'); from update_checker import VERSION; print(f'Multi-Max (Windows) version {VERSION}')"
+    popd
+    exit /b 0
+) else if /i "%~1"=="--update" (
+    echo Checking for updates...
+    python "%SCRIPT_DIR%\update_checker.py"
+    
+    if %ERRORLEVEL% NEQ 0 (
+        echo Update check failed. Please check your internet connection.
+    )
+    
+    echo.
+    echo Would you like to continue launching Multi-Max? (Y/N)
+    set /p continue_after_update=
+    if /i "!continue_after_update!"=="N" (
+        popd
+        exit /b 0
+    )
+    shift
+    goto :process_args
+) else (
+    set ADDITIONAL_ARGS=!ADDITIONAL_ARGS! %1
+    shift
+    goto :process_args
+)
+
+:continue_startup
+
 :: Check if we're running from the windows directory
 if not exist "check_windows_version.ps1" (
     echo ERROR: This launcher must be run from the windows directory.
@@ -126,6 +166,15 @@ if not exist "%PARENT_DIR%\logs" (
 set "log_file=%PARENT_DIR%\logs\multimax_log_%date:~-4,4%%date:~-10,2%%date:~-7,2%_%time:~0,2%%time:~3,2%%time:~6,2%.txt"
 set "log_file=%log_file: =0%"
 
+:: Build the command line with the update check flag if needed
+set "COMMAND_LINE=python main.py"
+if %SKIP_UPDATE_CHECK% EQU 1 (
+    set "COMMAND_LINE=%COMMAND_LINE% --skip-update-check"
+)
+if not "%ADDITIONAL_ARGS%"=="" (
+    set "COMMAND_LINE=%COMMAND_LINE% %ADDITIONAL_ARGS%"
+)
+
 :: Check if the virtual environment exists
 if exist "multi-max\Scripts\activate.bat" (
     :: Activate the virtual environment and run main.py
@@ -136,7 +185,7 @@ if exist "multi-max\Scripts\activate.bat" (
     echo Starting Multi-Max (Windows Version)...
     echo.
     
-    python main.py > "%log_file%" 2>&1
+    %COMMAND_LINE% > "%log_file%" 2>&1
     set ERRORLEVEL_SAVED=%ERRORLEVEL%
     
     :: Deactivate the virtual environment
@@ -150,7 +199,7 @@ if exist "multi-max\Scripts\activate.bat" (
     echo Starting Multi-Max (Windows Version)...
     echo.
     
-    python main.py > "%log_file%" 2>&1
+    %COMMAND_LINE% > "%log_file%" 2>&1
     set ERRORLEVEL_SAVED=%ERRORLEVEL%
     
     :: Deactivate the virtual environment
@@ -164,7 +213,7 @@ if exist "multi-max\Scripts\activate.bat" (
     echo Starting Multi-Max (Windows Version)...
     echo.
     
-    python main.py > "%log_file%" 2>&1
+    %COMMAND_LINE% > "%log_file%" 2>&1
     set ERRORLEVEL_SAVED=%ERRORLEVEL%
     
     :: Deactivate the virtual environment
@@ -175,7 +224,7 @@ if exist "multi-max\Scripts\activate.bat" (
     echo This might fail if dependencies aren't installed globally.
     echo.
     
-    python main.py > "%log_file%" 2>&1
+    %COMMAND_LINE% > "%log_file%" 2>&1
     set ERRORLEVEL_SAVED=%ERRORLEVEL%
     
     if %ERRORLEVEL_SAVED% NEQ 0 (
