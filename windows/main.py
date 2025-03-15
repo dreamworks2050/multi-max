@@ -433,6 +433,8 @@ fractal_debug = False
 fractal_source_position = 2
 prev_output_frame = None
 fractal_depth = 1
+is_fullscreen = False  # Track fullscreen state
+window_size = (1280, 720)  # Store original window size
 
 # Stats
 frame_count = 0
@@ -511,7 +513,7 @@ def compute_fractal_depth(live_frame, depth):
 def handle_keyboard_event(key_name, mod=None):
     """Handle keyboard inputs for adjusting settings."""
     global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug
-    global fractal_source_position, fractal_depth, prev_frames
+    global fractal_source_position, fractal_depth, prev_frames, is_fullscreen, window_size, screen
 
     old_grid_size = grid_size
     old_depth = depth
@@ -521,7 +523,17 @@ def handle_keyboard_event(key_name, mod=None):
     try:
         is_repeat = key_name in ['up', 'down'] and key_pressed.get(key_name, False) and time.time() - key_press_start.get(key_name, 0) > key_repeat_delay
         
-        if key_name == '4' and mode == "fractal" and (not mod or not (mod & pygame.KMOD_SHIFT)):
+        if key_name == 'w':
+            is_fullscreen = not is_fullscreen
+            if is_fullscreen:
+                window_size = screen.get_size()  # Save current window size
+                screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                logging.info("Full screen mode enabled")
+            else:
+                screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
+                logging.info("Window mode enabled")
+        
+        elif key_name == '4' and mode == "fractal" and (not mod or not (mod & pygame.KMOD_SHIFT)):
             mode = "fractal_depth"
             fractal_depth = 1
             logging.info("Mode changed to: fractal_depth (Mode [4])")
@@ -966,6 +978,7 @@ def main():
     global hardware_acceleration_available, cap, mode, fractal_grid_size, fractal_debug, fractal_source_position, prev_output_frame
     global enable_memory_tracing, fractal_depth, current_stream_url, last_buffer_warning_time, frame_drop_threshold
     global key_pressed, key_press_start, key_last_repeat, last_url_refresh_time, stream_url_refresh_interval, prev_frames
+    global is_fullscreen, window_size, screen
     
     key_pressed = {}
     key_press_start = {}
@@ -1117,7 +1130,7 @@ def main():
                 elif event.type == pygame.KEYDOWN:
                     key = pygame.key.name(event.key)
                     mod = event.mod
-                    if key in ['up', 'down', 'd', 's', 'f'] or (key in '0123456789' and mode != "fractal_depth"):
+                    if key in ['up', 'down', 'd', 's', 'f', 'w'] or (key in '0123456789' and mode != "fractal_depth"):
                         handle_keyboard_event(key, mod)
                     if key in ['up', 'down']:
                         key_pressed[key] = True
@@ -1264,13 +1277,16 @@ def main():
                     if mode == "grid":
                         texts.append("Press s to show/hide this info, d to debug, up/down to change grid size")
                         texts.append("Press 1-0 to set recursion depth (1-10)")
+                        texts.append("Press W to toggle full screen mode")
                     elif mode == "fractal":
                         texts.append("Press s to show/hide this info, d to debug, up/down grid size, f to switch modes")
                         texts.append("Press 1-3 to change source position: 1=top-left, 2=center (odd grids + 2x2 special case), 3=top-right")
                         texts.append("Press 4 to switch to fractal depth mode")
+                        texts.append("Press W to toggle full screen mode")
                     elif mode == "fractal_depth":
                         texts.append("Press s to show/hide this info, d to debug, f to switch modes")
                         texts.append("Press UP/DOWN arrow keys to increase/decrease depth level (1-100)")
+                        texts.append("Press W to toggle full screen mode")
                     line_height = 25
                     padding = 20
                     required_height = len(texts) * line_height + padding * 2
