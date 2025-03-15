@@ -1,6 +1,155 @@
 # Multi-Max for Windows
 
-This directory contains the Windows-specific version of Multi-Max, adapted from the Mac-specific original.
+## Simplified Installation and Update Guide
+
+This guide provides instructions for installing and running Multi-Max on Windows with our new simplified scripts. These scripts address common issues users have experienced with path resolution, Python environments, and Git-based updates.
+
+## Prerequisites
+
+- **Python 3.7 or higher** - [Download Python](https://www.python.org/downloads/)
+- **Git** (optional, required for updates) - [Download Git](https://git-scm.com/download/win)
+
+## Quick Start
+
+1. **Download** or clone the Multi-Max repository
+2. **Run `Simple-Install.bat`** to set up the environment
+3. **Run `Simple-Run.bat`** to start the application
+
+## Installation
+
+### Option 1: Simplified Installation (Recommended)
+
+1. Run the `Simple-Install.bat` script from the `windows` directory.
+2. The script will:
+   - Check for Python and Git
+   - Create a virtual environment
+   - Install required packages
+   - Set up the necessary directories and files
+
+### Option 2: Manual Installation
+
+If the simplified installation doesn't work for you:
+
+1. Install Python 3.7 or higher
+2. Create a virtual environment: `python -m venv venv`
+3. Activate the environment: `venv\Scripts\activate`
+4. Install dependencies: `pip install numpy opencv-python python-dotenv`
+5. Ensure `main.py` is in the parent directory of the `windows` folder
+
+## Running Multi-Max
+
+### Option 1: Using the Simple Launcher (Recommended)
+
+Run the `Simple-Run.bat` script from the `windows` directory. This script will:
+- Ensure all paths are correctly set
+- Activate the virtual environment if it exists
+- Check for updates using the simplified update checker
+- Run the main application
+
+### Option 2: Manual Execution
+
+If you prefer to run the application manually:
+1. Activate your virtual environment: `venv\Scripts\activate`
+2. Change to the parent directory of the `windows` folder
+3. Run: `python main.py`
+
+## Update System
+
+Multi-Max includes a simplified update system that works reliably on Windows. 
+
+### How Updates Work
+
+1. The launcher checks for updates when you start the application
+2. If updates are available, you'll be prompted to install them
+3. After updating, the application will restart automatically
+
+### Manual Update
+
+You can manually check for updates:
+
+1. Open a command prompt in the `windows` directory
+2. Run: `python simple_update_checker.py --auto-update`
+
+### Troubleshooting Updates
+
+If updates aren't working:
+
+1. Make sure Git is installed and in your PATH
+2. Ensure your Multi-Max installation is a Git repository
+3. Check permissions for the repository directory
+
+## Common Issues and Solutions
+
+### Application doesn't start
+
+- Check that Python is installed and in your PATH
+- Ensure all required packages are installed
+- Check the logs directory for error messages
+
+### "Main script not found" error
+
+- Make sure `main.py` exists in the parent directory of the `windows` folder
+- If not, copy it from the `windows` directory or reinstall Multi-Max
+
+### Update checker not working
+
+- Verify Git is installed and in your PATH
+- Ensure you have an internet connection
+- Check if your repository is properly configured
+
+### Missing dependencies
+
+- Run the `Simple-Install.bat` script again
+- Manually install the required packages in your virtual environment
+
+## Support
+
+If you encounter any issues:
+
+1. Check the logs in the `logs` directory
+2. Run the `Simple-Run.bat` script with the `--debug` flag
+3. Contact support with the log files and error messages
+
+## Advanced Configuration
+
+### VERSION File
+
+The `VERSION` file in the parent directory stores the current version number. This file is used by the update checker to determine if updates are available.
+
+### Update Checker Options
+
+The simplified update checker supports the following options:
+
+- `--auto-update`: Automatically install updates if available
+- `--version`: Display version information
+
+You can add these options to the `Simple-Run.bat` command line.
+
+## For Developers
+
+### File Structure
+
+- `windows/`: Contains Windows-specific scripts and utilities
+  - `Simple-Install.bat`: Sets up the environment
+  - `Simple-Run.bat`: Launches the application
+  - `simple_update_checker.py`: Handles update checking and installation
+- Parent directory: Contains the main application code
+
+### How the Update System Works
+
+The update system uses Git to check for and apply updates:
+
+1. The system checks if Git is available
+2. It verifies that we're in a Git repository
+3. It uses `git fetch` to check for remote changes
+4. It compares the local and remote branches
+5. If updates are available, it can automatically pull them
+
+---
+
+## Version History
+
+- **1.0.0**: Initial simplified Windows release
 
 ## Key Differences
 
