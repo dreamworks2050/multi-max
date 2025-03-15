@@ -518,5 +518,5 @@ Write-ColorOutput "You can now run Multi-Max by activating the virtual environme
 Write-ColorOutput "cd $installDir" "Cyan"
 Write-ColorOutput "$venvName\Scripts\Activate.ps1" "Cyan"
 Write-ColorOutput "python main.py" "Cyan"
-Write-ColorOutput "" "Green"
+Write-ColorOutput " " "Green"
 Write-ColorOutput "Note: This Windows version uses software rendering mode. Some features may be limited compared to the Mac version." "Yellow" 

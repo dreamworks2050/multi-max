@@ -1564,7 +1564,14 @@ def shutdown_application():
     if current_cap is not None:
         try:
             logging.info("Releasing video capture resources...")
-            current_cap.release()
+            # Redirect stderr temporarily to suppress the TLS error message
+            old_stderr = sys.stderr
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    sys.stderr = devnull
+                    current_cap.release()
+            finally:
+                sys.stderr = old_stderr
             cap = None
         except Exception as e:
             logging.error(f"Error while releasing video capture: {e}")
