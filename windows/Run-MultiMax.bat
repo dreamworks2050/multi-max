@@ -43,9 +43,18 @@ echo Python found in PATH >> "%LOG_FILE%"
 
 :: Check for version file
 if not exist "version.txt" (
-    echo WARNING: version.txt not found, will create default version file >> "%LOG_FILE%"
-    echo 1.0.2 > "version.txt"
-    echo Created default version.txt with version 1.0.2 >> "%LOG_FILE%"
+    echo WARNING: version.txt not found, will create it from remote source >> "%LOG_FILE%"
+    
+    :: Try to get the version from the remote repository
+    echo Attempting to get version from remote repository... >> "%LOG_FILE%"
+    powershell -Command "try { $version = (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dreamworks2050/multi-max/main/windows/version.txt' -UseBasicParsing).Content.Trim(); if ($version) { $version | Out-File 'version.txt' -NoNewline; Write-Output \"Downloaded remote version: $version\" } else { Write-Output 'Empty response from remote' } } catch { Write-Output \"Error fetching remote version: $_\"; 'unknown' | Out-File 'version.txt' -NoNewline }" >> "%LOG_FILE%" 2>&1
+    
+    if %ERRORLEVEL% NEQ 0 (
+        echo WARNING: Failed to get remote version, setting placeholder version >> "%LOG_FILE%"
+        echo unknown > "version.txt"
+    )
+    
+    echo Created version.txt file >> "%LOG_FILE%"
 )
 
 :: Check if main.py exists

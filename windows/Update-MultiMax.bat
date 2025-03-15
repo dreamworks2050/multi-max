@@ -443,10 +443,30 @@ if exist "%TEMP_DIR%\windows\version.txt" (
 ) else (
     echo WARNING: version.txt not found in downloaded files >> "%LOG_FILE%"
     echo WARNING: version.txt not found in downloaded files
-    echo Creating default version file with content "1.0.1" >> "%LOG_FILE%"
-    echo 1.0.1 > "%INSTALL_DIR%\version.txt"
-    echo Created default version file with version 1.0.1 in %INSTALL_DIR% >> "%LOG_FILE%"
-    echo Created default version file with version 1.0.1
+    
+    :: Try to get the version from the remote repository
+    echo Attempting to get version from remote repository... >> "%LOG_FILE%"
+    echo Attempting to get version from remote repository...
+    
+    :: Use PowerShell to fetch the latest version from GitHub
+    set "REMOTE_VERSION="
+    for /f "tokens=*" %%a in ('powershell -Command "try { $version = (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dreamworks2050/multi-max/main/windows/version.txt' -UseBasicParsing).Content.Trim(); Write-Output $version } catch { Write-Output 'unknown' }"') do (
+        set "REMOTE_VERSION=%%a"
+    )
+    
+    if not "!REMOTE_VERSION!"=="unknown" if not "!REMOTE_VERSION!"=="" (
+        echo Retrieved remote version: !REMOTE_VERSION! >> "%LOG_FILE%"
+        echo Retrieved remote version: !REMOTE_VERSION!
+        echo !REMOTE_VERSION! > "%INSTALL_DIR%\version.txt"
+        echo Created version file with remote version !REMOTE_VERSION! in %INSTALL_DIR% >> "%LOG_FILE%"
+        echo Created version file with remote version !REMOTE_VERSION!
+    ) else (
+        echo Failed to retrieve remote version, using unknown as placeholder >> "%LOG_FILE%"
+        echo Failed to retrieve remote version, using unknown as placeholder
+        echo unknown > "%INSTALL_DIR%\version.txt"
+        echo Created placeholder version file in %INSTALL_DIR% >> "%LOG_FILE%"
+        echo Created placeholder version file
+    )
 )
 
 :: Verify critical files exist after installation
