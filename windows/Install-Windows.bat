@@ -163,6 +163,42 @@ if %POWERSHELL_EXIT% EQU 0 (
     echo PowerShell installation failed. Attempting direct file installation...
     echo.
     
+    :: Ask user if they want to completely clean and overwrite the directory
+    echo Would you like to completely clean the installation directory and start fresh? (Y/N)
+    set /p clean_install=
+    if /i "!clean_install!"=="Y" (
+        echo Cleaning installation directory...
+        :: Create backups of custom files
+        if exist "%PARENT_DIR%\.env" (
+            echo Backing up .env configuration...
+            copy /Y "%PARENT_DIR%\.env" "%PARENT_DIR%\.env.backup-%BACKUP_TIME%" >nul
+        )
+        
+        :: Delete all files except windows directory and backups
+        pushd "%PARENT_DIR%"
+        for %%F in (*) do (
+            if not "%%~nxF"=="windows" (
+                if not "%%~xF"==".backup-%BACKUP_TIME%" (
+                    echo Removing: %%F
+                    del /F /Q "%%F" >nul 2>&1
+                )
+            )
+        )
+        
+        :: Also clean directories except windows and logs
+        for /d %%D in (*) do (
+            if not "%%~nxD"=="windows" (
+                if not "%%~nxD"=="logs" (
+                    echo Removing directory: %%D
+                    rmdir /S /Q "%%D" >nul 2>&1
+                )
+            )
+        )
+        popd
+        
+        echo Installation directory cleaned.
+    )
+    
     :: Try direct copy if PowerShell installer fails
     if exist "%SCRIPT_DIR%\main.py" (
         echo Copying Windows main.py to parent directory...
@@ -181,6 +217,16 @@ if %POWERSHELL_EXIT% EQU 0 (
             echo Successfully copied .env
         ) else (
             echo Failed to copy .env
+        )
+    )
+    
+    if exist "%SCRIPT_DIR%\requirements.txt" (
+        echo Copying Windows requirements.txt to parent directory...
+        copy /Y "%SCRIPT_DIR%\requirements.txt" "%PARENT_DIR%\requirements.txt" >nul
+        if %ERRORLEVEL% EQU 0 (
+            echo Successfully copied requirements.txt
+        ) else (
+            echo Failed to copy requirements.txt
         )
     )
 )
