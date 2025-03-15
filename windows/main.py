@@ -180,6 +180,28 @@ def perform_auto_update():
     try:
         logging.info("Starting complete reinstallation update process...")
         
+        # Create a clear "updating" indicator file
+        windows_dir = os.path.dirname(os.path.abspath(__file__))
+        updating_marker = os.path.join(windows_dir, "UPDATING_IN_PROGRESS.txt")
+        try:
+            with open(updating_marker, 'w') as f:
+                f.write(f"Update started at: {time.ctime()}\n")
+                f.write(f"From version: {get_local_version()}\n")
+                f.write(f"This file indicates that Multi-Max is in the process of updating.\n")
+                f.write(f"If you see this file after a failed update, you can manually run:\n")
+                f.write(f"{windows_dir}\\Update-MultiMax.bat\n")
+        except Exception as e:
+            logging.warning(f"Could not create updating marker file: {e}")
+        
+        # Try to clean up any running processes or threads
+        try:
+            # Stop any running threads
+            if 'frame_reader_thread' in globals() and globals()['frame_reader_thread'] is not None:
+                globals()['should_stop_frame_reader'] = True
+                # Don't wait for join - just signal it to stop
+        except Exception as cleanup_err:
+            logging.error(f"Error during pre-update cleanup: {cleanup_err}")
+        
         # Create and display an update notification window
         try:
             # Initialize only the necessary components
@@ -217,10 +239,11 @@ def perform_auto_update():
                     "A new version of Multi-Max is available!",
                     "The application will now update automatically.",
                     "This process will completely reinstall Multi-Max.",
-                    "Please be patient and do not close any windows that appear."
+                    "Please be patient and do not close any windows that appear.",
+                    "The application will restart automatically after updating."
                 ]
                 
-                y_position = 50
+                y_position = 30
                 for line in lines:
                     try:
                         text = font.render(line, True, (255, 255, 255))
@@ -233,7 +256,17 @@ def perform_auto_update():
                 pygame.display.flip()
                 
                 # Wait a moment for the user to read the message
-                time.sleep(3)
+                for i in range(5):
+                    # Display a countdown
+                    try:
+                        # Clear the previous countdown
+                        pygame.draw.rect(info_screen, (0, 0, 0), (50, y_position, 500, 30))
+                        countdown_text = font.render(f"Update will begin in {5-i} seconds...", True, (255, 255, 0))
+                        info_screen.blit(countdown_text, (50, y_position))
+                        pygame.display.flip()
+                    except:
+                        pass
+                    time.sleep(1)
             except:
                 # Continue with update even if text rendering fails
                 pass
@@ -247,22 +280,67 @@ def perform_auto_update():
             logging.error(f"Error showing update notification: {e}")
             # Continue with update even if notification fails
         
-        # Try to clean up any running processes or threads
+        # Create a separate process to handle the update
         try:
-            # Stop any running threads
-            if 'frame_reader_thread' in globals() and globals()['frame_reader_thread'] is not None:
-                globals()['should_stop_frame_reader'] = True
-                # Don't wait for join - just signal it to stop
-        except Exception as cleanup_err:
-            logging.error(f"Error during pre-update cleanup: {cleanup_err}")
+            # Create a temporary batch file that will:
+            # 1. Wait for this process to exit
+            # 2. Launch the update script
+            temp_dir = os.environ.get('TEMP', os.path.expanduser('~'))
+            updater_script = os.path.join(temp_dir, "multimax_update_launcher.bat")
+            
+            with open(updater_script, 'w') as f:
+                f.write('@echo off\n')
+                f.write('echo Multi-Max Update Launcher\n')
+                f.write('echo ==============================================\n')
+                f.write('echo This window will handle the update process.\n')
+                f.write('echo Please do not close this window.\n')
+                f.write('echo.\n')
+                f.write(f'echo Waiting for process with PID {os.getpid()} to exit...\n')
+                f.write('echo.\n')
+                f.write('timeout /t 3 /nobreak > nul\n')  # Wait 3 seconds for the main app to exit
+                
+                # Add the update script path 
+                update_script_path = os.path.join(windows_dir, "Update-MultiMax.bat")
+                f.write(f'echo Starting update from: {update_script_path}\n')
+                f.write('echo.\n')
+                
+                # Try different methods to launch the update script with admin rights
+                f.write('echo Attempting to run update with administrative privileges...\n')
+                f.write(f'powershell -Command "Start-Process -FilePath \'{update_script_path}\' -Verb RunAs"\n')
+                f.write('if %ERRORLEVEL% NEQ 0 (\n')
+                f.write('    echo Failed to launch with PowerShell. Trying alternative method...\n')
+                f.write(f'    start "" "{update_script_path}"\n')
+                f.write(')\n')
+                
+                f.write('echo.\n')
+                f.write('echo If a User Account Control prompt appears, please click "Yes".\n')
+                f.write('echo.\n')
+                f.write('echo This window will close in 10 seconds.\n')
+                f.write('timeout /t 10\n')
+            
+            # Launch the updater script
+            # Use startupinfo to prevent a console window from appearing
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            # Start the process with a visible window
+            subprocess.Popen(
+                ['cmd.exe', '/c', 'start', 'Multi-Max Update Launcher', updater_script],
+                shell=True,
+                startupinfo=si
+            )
+            
+            logging.info(f"Created and launched updater script at: {updater_script}")
+        except Exception as script_err:
+            logging.error(f"Failed to create updater script: {script_err}")
+            # Try to directly launch the update module as a fallback
         
-        # Import the update module from the windows directory
+        # Import the update module from the windows directory as a fallback
         try:
             # Use a relative import first
             from . import update
         except (ImportError, ValueError):
             # If that fails, try a direct import after adding the windows dir to path
-            windows_dir = os.path.dirname(os.path.abspath(__file__))
             if windows_dir not in sys.path:
                 sys.path.append(windows_dir)
             try:
@@ -273,26 +351,14 @@ def perform_auto_update():
                 logging.info("Forcing exit due to update request")
                 sys.exit(0)
         
-        # Create a marker file to indicate update was initiated
-        windows_dir = os.path.dirname(os.path.abspath(__file__))
+        # Try to start the update through the module as well (backup method)
         try:
-            with open(os.path.join(windows_dir, "update_requested.txt"), 'w') as f:
-                f.write(f"Update requested at: {time.ctime()}\n")
-                f.write(f"From version: {get_local_version()}\n")
-        except Exception as marker_err:
-            logging.warning(f"Could not write update marker file: {marker_err}")
+            update_result = update.start_update_process()
+            if update_result:
+                logging.info("Update process initiated via module successfully")
+        except Exception as module_err:
+            logging.error(f"Error starting update via module: {module_err}")
         
-        # Start the update process using the update module
-        update_started = False
-        try:
-            update_started = update.start_update_process()
-            if update_started:
-                logging.info("Update process initiated successfully. Exiting current instance.")
-            else:
-                logging.error("Failed to start update process - will exit anyway")
-        except Exception as update_err:
-            logging.error(f"Exception during update process: {update_err}")
-            
         # Always exit regardless of whether update started successfully
         # This ensures we don't proceed with normal startup
         logging.info("Exiting application for update")
@@ -301,14 +367,16 @@ def perform_auto_update():
         time.sleep(1)
         
         # Force exit with success code
-        sys.exit(0)
+        logging.shutdown()
+        os._exit(0)  # Use os._exit to force immediate termination
     except Exception as e:
         logging.error(f"Failed to perform automatic update: {e}")
         logging.error(traceback.format_exc())
         
         # Still exit even if there was an error to avoid starting the application
         logging.info("Exiting due to update request despite errors")
-        sys.exit(1)
+        logging.shutdown()
+        os._exit(1)  # Use os._exit to force immediate termination
 
 def check_for_updates():
     """Check if an update is available and trigger the update process if needed."""
