@@ -188,6 +188,8 @@ def start_frame_reader_thread(video_source, stream_url, original_youtube_url, bu
         
         def open_capture(url=None):
             nonlocal thread_cap, consecutive_failures, reconnection_backoff, last_reconnect_attempt
+            # Use current_stream_url which is a global variable set in start_frame_reader_thread
+            global current_stream_url
             capture_url = url if url is not None else current_stream_url
             
             if thread_cap is not None:
@@ -239,6 +241,7 @@ def start_frame_reader_thread(video_source, stream_url, original_youtube_url, bu
             reconnection_backoff = min(reconnection_backoff * 1.5, max_reconnection_backoff)
             return False
             
+        # Initialize capture after all variables are defined
         if not open_capture():
             logging.error("Frame reader could not open video source")
         
@@ -923,9 +926,10 @@ def calculate_visible_screens(fractal_grid_size, frame_width, frame_height):
     one_pixel_level = np.log(min_dim) / np.log(fractal_grid_size)
     exact_pixel_level = int(np.floor(one_pixel_level)) if abs(min_dim / (fractal_grid_size ** int(np.floor(one_pixel_level))) - 1.0) < abs(min_dim / (fractal_grid_size ** int(np.ceil(one_pixel_level))) - 1.0) else int(np.ceil(one_pixel_level))
     
-    for k in range(max_level + 2):
-        cell_size = min_dim / (fractal_grid_size ** k)
+    for k in range(max_level + 1):
         screens_at_level = r ** k
+        cell_size = min_dim / (fractal_grid_size ** k)
+        
         if k <= max_level:
             visible_screens += screens_at_level
         if k == exact_pixel_level:
