@@ -25,7 +25,7 @@ import re
 __windows_specific_version__ = True
 
 # Current version - centralized in one place
-CURRENT_VERSION = "1.0.1"  # Update this value when releasing a new version
+CURRENT_VERSION = "1.0.2"  # Update this value when releasing a new version
 
 # Setup version checking mechanism with corrected paths
 CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
