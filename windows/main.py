@@ -20,12 +20,10 @@ import requests
 import sys
 from pathlib import Path
 import re
+import tkinter as tk
 
 # Windows-specific version marker - DO NOT REMOVE - used by installer to verify correct version
 __windows_specific_version__ = True
-
-# Current version - centralized in one place
-CURRENT_VERSION = "1.0.2"  # Update this value when releasing a new version
 
 # Setup version checking mechanism with corrected paths
 CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
@@ -33,488 +31,437 @@ CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 PARENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "version.txt")
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/dreamworks2050/multi-max/main/windows/version.txt"
 VERSION_CHECK_TIMEOUT = 5  # seconds
+DEFAULT_VERSION = "1.0.1"  # Default version for new installations
 
 def get_local_version():
     """Read the local version number from version.txt file, creating it if it doesn't exist."""
-    try:
-        # First try the version file in the windows directory
-        if os.path.exists(CURRENT_VERSION_FILE):
+    # Try to read from the windows dir first
+    if os.path.exists(CURRENT_VERSION_FILE):
+        try:
             with open(CURRENT_VERSION_FILE, 'r') as f:
                 version = f.read().strip()
-                # If the file exists but is empty or has an invalid format, write the current version
-                if not version:
-                    with open(CURRENT_VERSION_FILE, 'w') as fw:
-                        fw.write(CURRENT_VERSION)
-                    version = CURRENT_VERSION
-                    logging.info(f"Wrote current version to empty file: {version}")
                 logging.info(f"Found local version in windows directory: {version}")
-                return version
-        
-        # If not found, try the parent directory
-        if os.path.exists(PARENT_VERSION_FILE):
+                if version:
+                    return version
+        except Exception as e:
+            logging.warning(f"Error reading version file from windows directory: {e}")
+    
+    # Try the parent directory as fallback (older installations might have it there)
+    if os.path.exists(PARENT_VERSION_FILE):
+        try:
             with open(PARENT_VERSION_FILE, 'r') as f:
                 version = f.read().strip()
-                # If parent file exists but windows file doesn't, write the version to windows file too
-                if not os.path.exists(CURRENT_VERSION_FILE):
-                    try:
-                        with open(CURRENT_VERSION_FILE, 'w') as fw:
-                            fw.write(version)
-                        logging.info(f"Copied version from parent directory to windows directory: {version}")
-                    except Exception as write_err:
-                        logging.warning(f"Could not write version to windows directory: {write_err}")
                 logging.info(f"Found local version in parent directory: {version}")
-                return version
-                
-        # If neither exists, create the file with the current version
-        logging.warning(f"Local version file not found at {CURRENT_VERSION_FILE}")
-        logging.warning(f"Also checked {PARENT_VERSION_FILE}")
-        logging.info(f"Creating version file with current version: {CURRENT_VERSION}")
+                if version:
+                    # Copy to windows directory for consistency
+                    try:
+                        with open(CURRENT_VERSION_FILE, 'w') as f:
+                            f.write(version)
+                        logging.info(f"Copied version '{version}' to windows directory")
+                    except Exception as e:
+                        logging.warning(f"Could not copy version to windows directory: {e}")
+                    return version
+        except Exception as e:
+            logging.warning(f"Error reading version file from parent directory: {e}")
+    
+    # If we couldn't read from either location or they were empty, create the file with default version
+    logging.warning("Version file not found or empty, creating with default version")
+    try:
+        # Ensure the windows directory exists
+        windows_dir = os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(windows_dir, exist_ok=True)
         
-        try:
-            # Create the windows version file
-            with open(CURRENT_VERSION_FILE, 'w') as f:
-                f.write(CURRENT_VERSION)
-            
-            # Also create parent version file for consistency
-            os.makedirs(os.path.dirname(PARENT_VERSION_FILE), exist_ok=True)
-            with open(PARENT_VERSION_FILE, 'w') as f:
-                f.write(CURRENT_VERSION)
-                
-            return CURRENT_VERSION
-        except Exception as create_err:
-            logging.error(f"Error creating version file: {create_err}")
-            return CURRENT_VERSION  # Return the current version anyway
-            
+        with open(CURRENT_VERSION_FILE, 'w') as f:
+            f.write(DEFAULT_VERSION)
+        logging.info(f"Created version file with default version: {DEFAULT_VERSION}")
+        return DEFAULT_VERSION
     except Exception as e:
-        logging.error(f"Error reading local version: {e}")
-        return CURRENT_VERSION  # Return the current version as fallback
+        logging.error(f"Could not create version file: {e}")
+        return DEFAULT_VERSION
 
 def get_remote_version():
-    """Fetch the latest version number from the repository."""
+    """Check GitHub for the latest version number."""
     try:
-        logging.info(f"Checking for updates from: {REMOTE_VERSION_URL}")
         response = requests.get(REMOTE_VERSION_URL, timeout=VERSION_CHECK_TIMEOUT)
         if response.status_code == 200:
-            remote_version = response.text.strip()
-            logging.info(f"Retrieved remote version: {remote_version}")
-            return remote_version
-        else:
-            logging.warning(f"Failed to fetch remote version. Status code: {response.status_code}")
-            return None
-    except requests.RequestException as e:
-        logging.warning(f"Network error while checking for updates: {e}")
-        return None
+            version = response.text.strip()
+            logging.info(f"Latest remote version: {version}")
+            
+            # Write to local version file for future reference
+            try:
+                with open(CURRENT_VERSION_FILE, 'w') as f:
+                    f.write(version)
+                logging.debug(f"Updated local version file with remote version: {version}")
+            except Exception as e:
+                logging.warning(f"Could not update local version file: {e}")
+                
+            return version
     except Exception as e:
-        logging.error(f"Unexpected error checking for updates: {e}")
-        return None
+        logging.warning(f"Failed to check for updates: {e}")
+    return None
+
+def normalize_version(version_str):
+    """Convert version string to tuple of integers for proper comparison."""
+    try:
+        # Remove any non-numeric characters except dots and split by dots
+        version_str = re.sub(r'[^\d\.]', '', version_str)
+        return tuple(map(int, version_str.split('.')))
+    except Exception as e:
+        logging.warning(f"Error normalizing version '{version_str}': {e}")
+        # Default to (0,) if version can't be parsed
+        return (0,)
 
 def versions_need_update(local_version, remote_version):
-    """Compare version numbers to determine if an update is needed."""
-    if not remote_version:
+    """Compare local and remote versions to determine if an update is needed."""
+    if not local_version or not remote_version:
+        logging.warning("Missing version information, cannot determine if update is needed")
         return False
         
-    # Normalize versions - handle any unexpected characters or formats
-    def normalize_version(version_str):
-        if not version_str:
-            return "0.0.0"
-            
-        # Remove any whitespace
-        version_str = version_str.strip()
-        
-        # Keep only digits and dots
-        version_str = re.sub(r'[^\d.]', '', version_str)
-        
-        # Ensure at least one dot
-        if '.' not in version_str:
-            version_str = version_str + '.0'
-            
-        # Handle consecutive dots
-        while '..' in version_str:
-            version_str = version_str.replace('..', '.0.')
-            
-        # Remove trailing dot if any
-        if version_str.endswith('.'):
-            version_str = version_str + '0'
-            
-        # Handle empty version
-        if not version_str or version_str == '.':
-            return "0.0.0"
-            
-        return version_str
-    
     try:
-        local_version = normalize_version(local_version)
-        remote_version = normalize_version(remote_version)
+        # Normalize versions for comparison
+        local_norm = normalize_version(local_version)
+        remote_norm = normalize_version(remote_version)
         
-        logging.debug(f"Comparing versions - local: {local_version}, remote: {remote_version}")
-        
-        # If version strings are identical, no update needed
-        if local_version == remote_version:
-            return False
-            
-        # Split versions into components and convert to integers for comparison
-        local_parts = [int(p) for p in local_version.split('.')]
-        remote_parts = [int(p) for p in remote_version.split('.')]
-        
-        # Pad shorter version with zeros
-        while len(local_parts) < len(remote_parts):
-            local_parts.append(0)
-        while len(remote_parts) < len(local_parts):
-            remote_parts.append(0)
-            
-        # Compare each part
-        for local, remote in zip(local_parts, remote_parts):
-            if remote > local:
-                return True
-            if local > remote:
-                return False
-                
-        # If we get here, versions are equal
-        return False
-    except (ValueError, AttributeError, IndexError) as e:
-        logging.error(f"Error comparing versions ({local_version} vs {remote_version}): {e}")
+        needs_update = remote_norm > local_norm
+        logging.info(f"Version comparison: local={local_version} ({local_norm}), remote={remote_version} ({remote_norm}), needs_update={needs_update}")
+        return needs_update
+    except Exception as e:
+        logging.error(f"Error comparing versions: {e}")
         return False
 
 def perform_auto_update():
-    """Trigger the complete auto update process that wipes and reinstalls everything."""
+    """Complete reinstallation of Multi-Max via the update script."""
+    logging.info("Starting complete reinstallation update process")
+    
+    # Create a marker file to indicate that we're updating
+    windows_dir = os.path.dirname(os.path.abspath(__file__))
+    marker_file = os.path.join(windows_dir, "UPDATING_IN_PROGRESS.txt")
+    
     try:
-        logging.info("Starting complete reinstallation update process...")
+        with open(marker_file, 'w') as f:
+            f.write(f"Update started at: {time.ctime()}\n")
+            current_version = get_local_version()
+            f.write(f"From version: {current_version}\n")
+    except Exception as e:
+        logging.warning(f"Could not create update marker file: {e}")
+    
+    # Clean up any existing processes or threads
+    try:
+        logging.info("Stopping frame reader thread before update")
+        stop_frame_reader_thread()
+    except Exception as e:
+        logging.warning(f"Error stopping frame reader thread: {e}")
+    
+    # Let the user know we're updating
+    try:
+        # Create a basic notification window
+        root = tk.Tk()
+        root.title("Multi-Max Update")
+        root.geometry("400x200")
+        root.configure(bg='#2e2e2e')
         
-        # Create a clear "updating" indicator file
-        windows_dir = os.path.dirname(os.path.abspath(__file__))
-        updating_marker = os.path.join(windows_dir, "UPDATING_IN_PROGRESS.txt")
+        frame = tk.Frame(root, bg='#2e2e2e')
+        frame.pack(expand=True, fill='both', padx=20, pady=20)
+        
+        label = tk.Label(frame, 
+                        text="Multi-Max is updating...\n\nThe application will close and restart automatically.\n\nThis window will close in 5 seconds.",
+                        fg='white', bg='#2e2e2e', font=("Arial", 12))
+        label.pack(pady=20)
+        
+        # Add a countdown
+        countdown_label = tk.Label(frame, text="5", fg='white', bg='#2e2e2e', font=("Arial", 14, "bold"))
+        countdown_label.pack(pady=10)
+        
+        # Update the countdown every second
+        for i in range(4, -1, -1):
+            root.after(1000 * (5-i), lambda i=i: countdown_label.config(text=str(i)))
+        
+        # Close the window after 5 seconds
+        root.after(5000, root.destroy)
+        
+        # Center the window on screen
+        root.update_idletasks()
+        width = root.winfo_width()
+        height = root.winfo_height()
+        x = (root.winfo_screenwidth() // 2) - (width // 2)
+        y = (root.winfo_screenheight() // 2) - (height // 2)
+        root.geometry('{}x{}+{}+{}'.format(width, height, x, y))
+        
+        root.mainloop()
+    except Exception as e:
+        logging.error(f"Error showing update notification: {e}")
+    
+    # Try to properly shutdown Pygame first to avoid conflicts
+    if pygame.get_init():
         try:
-            with open(updating_marker, 'w') as f:
-                f.write(f"Update started at: {time.ctime()}\n")
-                f.write(f"From version: {get_local_version()}\n")
-                f.write(f"This file indicates that Multi-Max is in the process of updating.\n")
-                f.write(f"If you see this file after a failed update, you can manually run:\n")
-                f.write(f"{windows_dir}\\Update-MultiMax.bat\n")
+            pygame.quit()
+            logging.info("Pygame shut down successfully before update")
+        except Exception as pg_err:
+            logging.warning(f"Failed to properly shutdown Pygame: {pg_err}")
+    
+    # Import the update module
+    try:
+        import update
+        logging.info("Successfully imported update module")
+        
+        # Start the update process
+        try:
+            update_attempted = False
+            
+            # Try up to 3 times to start the update process
+            for attempt in range(3):
+                if attempt > 0:
+                    logging.warning(f"Retry attempt {attempt} to start update process")
+                    time.sleep(1)  # Brief pause between attempts
+                    
+                # Launch the update process
+                update_success = update.start_update_process()
+                update_attempted = True
+                
+                if update_success:
+                    logging.info(f"Update process started successfully on attempt {attempt+1}, exiting application")
+                    # Successful exit
+                    os._exit(0)
+            
+            if update_attempted:
+                logging.error("All attempts to start update process failed")
+            else:
+                logging.error("Failed to attempt update process")
+                
+            # Error exit
+            os._exit(1)
         except Exception as e:
-            logging.warning(f"Could not create updating marker file: {e}")
+            logging.error(f"Error during update process: {e}")
+            logging.exception("Stack trace:")
+            # Critical error exit
+            os._exit(2)
+    except ImportError as e:
+        logging.error(f"Failed to import update module: {e}")
         
-        # Try to clean up any running processes or threads
+        # Try to manually run the update process
         try:
-            # Stop any running threads
-            if 'frame_reader_thread' in globals() and globals()['frame_reader_thread'] is not None:
-                globals()['should_stop_frame_reader'] = True
-                # Don't wait for join - just signal it to stop
-        except Exception as cleanup_err:
-            logging.error(f"Error during pre-update cleanup: {cleanup_err}")
-        
-        # Create and display an update notification window
-        try:
-            # Initialize only the necessary components
-            pygame.init()
+            logging.info("Attempting to run Update-MultiMax.bat directly as fallback")
+            windows_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(windows_dir)
             
-            # Use a more basic approach for font creation that's less likely to fail
-            try:
-                font = pygame.font.SysFont('Arial', 18)
-                if not font:
-                    # Sometimes SysFont fails silently
-                    fonts = pygame.font.get_fonts()
-                    if fonts:
-                        font = pygame.font.SysFont(fonts[0], 18)
-                    else:
-                        # Last resort default font
-                        font = pygame.font.Font(None, 18)
-            except:
-                # If all font attempts fail, use the default font
-                font = pygame.font.Font(None, 18)
-                
-            # Create display with more error handling
-            try:
-                info_screen = pygame.display.set_mode((600, 200))
-                pygame.display.set_caption("Multi-Max Update")
-            except:
-                # Use a smaller size if the display creation fails
-                info_screen = pygame.display.set_mode((400, 150))
-                pygame.display.set_caption("Update")
-            
-            info_screen.fill((0, 0, 0))
-            
-            # Render and display text with error handling
-            try:
-                lines = [
-                    "A new version of Multi-Max is available!",
-                    "The application will now update automatically.",
-                    "This process will completely reinstall Multi-Max.",
-                    "Please be patient and do not close any windows that appear.",
-                    "The application will restart automatically after updating."
-                ]
-                
-                y_position = 30
-                for line in lines:
-                    try:
-                        text = font.render(line, True, (255, 255, 255))
-                        info_screen.blit(text, (50, y_position))
-                        y_position += 30
-                    except:
-                        # Skip any lines that fail to render
-                        pass
-                        
-                pygame.display.flip()
-                
-                # Wait a moment for the user to read the message
-                for i in range(5):
-                    # Display a countdown
-                    try:
-                        # Clear the previous countdown
-                        pygame.draw.rect(info_screen, (0, 0, 0), (50, y_position, 500, 30))
-                        countdown_text = font.render(f"Update will begin in {5-i} seconds...", True, (255, 255, 0))
-                        info_screen.blit(countdown_text, (50, y_position))
-                        pygame.display.flip()
-                    except:
-                        pass
-                    time.sleep(1)
-            except:
-                # Continue with update even if text rendering fails
-                pass
-                
-            # Close pygame properly before launching the updater
-            try:
-                pygame.quit()
-            except:
-                pass
-        except Exception as e:
-            logging.error(f"Error showing update notification: {e}")
-            # Continue with update even if notification fails
-        
-        # Create a separate process to handle the update
-        try:
-            # Create a temporary batch file that will:
-            # 1. Wait for this process to exit
-            # 2. Launch the update script
+            # Create a basic update launcher
             temp_dir = os.environ.get('TEMP', os.path.expanduser('~'))
-            updater_script = os.path.join(temp_dir, "multimax_update_launcher.bat")
+            launcher_file = os.path.join(temp_dir, "multimax_update_launcher.bat")
             
-            with open(updater_script, 'w') as f:
+            # Find the update script
+            update_script = None
+            potential_paths = [
+                os.path.join(windows_dir, "Update-MultiMax.bat"),
+                os.path.join(parent_dir, "Update-MultiMax.bat"),
+                os.path.join(os.getcwd(), "Update-MultiMax.bat")
+            ]
+            
+            for path in potential_paths:
+                if os.path.exists(path):
+                    update_script = path
+                    logging.info(f"Found update script at: {update_script}")
+                    break
+            
+            # If not found, create it
+            if not update_script:
+                logging.warning("Update script not found, creating a basic one")
+                update_script = os.path.join(windows_dir, "Update-MultiMax.bat")
+                
+                # Template for a basic update script
+                with open(update_script, 'w') as f:
+                    f.write('@echo off\n')
+                    f.write('echo Multi-Max Emergency Update\n')
+                    f.write('echo ============================\n')
+                    f.write('echo This will download the latest version\n\n')
+                    f.write('set "TEMP_DIR=%TEMP%\\multi-max-update"\n')
+                    f.write('mkdir "%TEMP_DIR%" 2>nul\n')
+                    f.write('cd /d "%TEMP_DIR%"\n\n')
+                    f.write('echo Downloading latest updater...\n')
+                    f.write('powershell -Command "Invoke-WebRequest -Uri \'https://github.com/dreamworks2050/multi-max/raw/main/windows/Update-MultiMax.bat\' -OutFile \'Update-MultiMax.bat\'"\n\n')
+                    f.write('if exist "Update-MultiMax.bat" (\n')
+                    f.write('    echo Running the updater now...\n')
+                    f.write('    call "Update-MultiMax.bat"\n')
+                    f.write('    exit /b\n')
+                    f.write(') else (\n')
+                    f.write('    echo ERROR: Could not download the updater\n')
+                    f.write('    echo Please download Multi-Max manually from GitHub\n')
+                    f.write('    pause\n')
+                    f.write('    exit /b 1\n')
+                    f.write(')\n')
+                
+                logging.info(f"Created basic update script at: {update_script}")
+            
+            # Create a launcher that will run the script
+            with open(launcher_file, 'w') as f:
                 f.write('@echo off\n')
-                f.write('echo Multi-Max Update Launcher\n')
+                f.write('title Multi-Max Update Launcher\n')
+                f.write('echo ==============================================\n')
+                f.write('echo    Multi-Max Update Launcher\n')
                 f.write('echo ==============================================\n')
                 f.write('echo This window will handle the update process.\n')
-                f.write('echo Please do not close this window.\n')
-                f.write('echo.\n')
+                f.write('echo Please do not close this window.\n\n')
+                
+                # Wait for our process to exit
                 f.write(f'echo Waiting for process with PID {os.getpid()} to exit...\n')
-                f.write('echo.\n')
-                f.write('timeout /t 3 /nobreak > nul\n')  # Wait 3 seconds for the main app to exit
+                f.write('timeout /t 3 > nul\n\n')
                 
-                # Add the update script path 
-                update_script_path = os.path.join(windows_dir, "Update-MultiMax.bat")
-                f.write(f'echo Starting update from: {update_script_path}\n')
-                f.write('echo.\n')
+                f.write(f'echo Starting update from: {update_script}\n\n')
                 
-                # Try different methods to launch the update script with admin rights
+                # Try multiple methods to launch
                 f.write('echo Attempting to run update with administrative privileges...\n')
-                f.write(f'powershell -Command "Start-Process -FilePath \'{update_script_path}\' -Verb RunAs"\n')
+                f.write(f'powershell -Command "Start-Process -FilePath \'{update_script}\' -Verb RunAs"\n')
                 f.write('if %ERRORLEVEL% NEQ 0 (\n')
                 f.write('    echo Failed to launch with PowerShell. Trying alternative method...\n')
-                f.write(f'    start "" "{update_script_path}"\n')
-                f.write(')\n')
+                f.write(f'    call "{update_script}"\n')
+                f.write(')\n\n')
                 
-                f.write('echo.\n')
-                f.write('echo If a User Account Control prompt appears, please click "Yes".\n')
-                f.write('echo.\n')
+                f.write('echo If a User Account Control prompt appears, please click "Yes".\n\n')
                 f.write('echo This window will close in 10 seconds.\n')
                 f.write('timeout /t 10\n')
             
-            # Launch the updater script
-            # Use startupinfo to prevent a console window from appearing
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            logging.info(f"Created update launcher at: {launcher_file}")
             
-            # Start the process with a visible window
+            # Launch the update launcher
             subprocess.Popen(
-                ['cmd.exe', '/c', 'start', 'Multi-Max Update Launcher', updater_script],
-                shell=True,
-                startupinfo=si
+                f'cmd.exe /c start "Multi-Max Update Launcher" "{launcher_file}"', 
+                shell=True
             )
+            logging.info("Launched update launcher")
             
-            logging.info(f"Created and launched updater script at: {updater_script}")
-        except Exception as script_err:
-            logging.error(f"Failed to create updater script: {script_err}")
-            # Try to directly launch the update module as a fallback
-        
-        # Import the update module from the windows directory as a fallback
-        try:
-            # Use a relative import first
-            from . import update
-        except (ImportError, ValueError):
-            # If that fails, try a direct import after adding the windows dir to path
-            if windows_dir not in sys.path:
-                sys.path.append(windows_dir)
-            try:
-                import update
-            except ImportError:
-                logging.error("Failed to import update module")
-                # Even if we fail to import, we should exit since user chose to update
-                logging.info("Forcing exit due to update request")
-                sys.exit(0)
-        
-        # Try to start the update through the module as well (backup method)
-        try:
-            update_result = update.start_update_process()
-            if update_result:
-                logging.info("Update process initiated via module successfully")
-        except Exception as module_err:
-            logging.error(f"Error starting update via module: {module_err}")
-        
-        # Always exit regardless of whether update started successfully
-        # This ensures we don't proceed with normal startup
-        logging.info("Exiting application for update")
-        
-        # Sleep briefly to allow the update process to start and logs to be written
-        time.sleep(1)
-        
-        # Force exit with success code
-        logging.shutdown()
-        os._exit(0)  # Use os._exit to force immediate termination
-    except Exception as e:
-        logging.error(f"Failed to perform automatic update: {e}")
-        logging.error(traceback.format_exc())
-        
-        # Still exit even if there was an error to avoid starting the application
-        logging.info("Exiting due to update request despite errors")
-        logging.shutdown()
-        os._exit(1)  # Use os._exit to force immediate termination
+            # Force exit since we're in an inconsistent state
+            os._exit(0)
+        except Exception as e:
+            logging.error(f"Failed to manually start update process: {e}")
+            logging.exception("Stack trace:")
+            # Force exit since we're in an inconsistent state
+            os._exit(1)
 
 def check_for_updates():
-    """Check if an update is available and trigger the update process if needed."""
-    logging.info("Checking for updates...")
-    
+    """Check for updates and prompt user if an update is available."""
     try:
         local_version = get_local_version()
-        logging.info(f"Current version: {local_version}")
+        remote_version = get_remote_version()
         
-        # Ensure we have a valid local version
-        if not local_version or local_version.strip() == "":
-            logging.warning("Could not determine local version, will skip update check")
+        if not remote_version:
+            logging.warning("Could not get remote version, skipping update check")
             return False
-        
-        # Add retry logic for network operations
-        max_retries = 3
-        retry_delay = 1.0
-        remote_version = None
-        
-        for retry in range(max_retries):
-            try:
-                remote_version = get_remote_version()
-                if remote_version:
-                    break
-                    
-                logging.warning(f"Failed to get remote version (attempt {retry+1}/{max_retries})")
-                if retry < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 1.5  # Exponential backoff
-            except Exception as e:
-                logging.error(f"Error during update check attempt {retry+1}: {e}")
-                if retry < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 1.5
-        
-        if remote_version:
-            logging.info(f"Latest available version: {remote_version}")
             
-            # Write the detected remote version to disk for debugging purposes
-            try:
-                debug_version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_detected_version.txt")
-                with open(debug_version_file, 'w') as f:
-                    f.write(f"Local: {local_version}\nRemote: {remote_version}\nTimestamp: {time.ctime()}")
-            except Exception as e:
-                logging.warning(f"Could not write debug version file: {e}")
+        if versions_need_update(local_version, remote_version):
+            logging.info(f"Update available: local={local_version}, remote={remote_version}")
             
-            if versions_need_update(local_version, remote_version):
-                logging.info(f"New version available: {remote_version} (current: {local_version})")
-                # Ask user before updating
-                try:
-                    pygame.init()
-                    info_screen = pygame.display.set_mode((600, 250))
-                    pygame.display.set_caption("Multi-Max Update Available")
-                    font = pygame.font.SysFont('Arial', 18)
-                    button_font = pygame.font.SysFont('Arial', 16)
+            # Create an update prompt window
+            if pygame.get_init():
+                # Using pygame if already initialized
+                screen = pygame.display.get_surface()
+                font = pygame.font.Font(None, 36)
+                
+                if screen and font:
+                    # Darken the current screen
+                    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+                    overlay.fill((0, 0, 0, 180))  # Semi-transparent black
+                    screen.blit(overlay, (0, 0))
                     
-                    info_screen.fill((0, 0, 0))
-                    update_text1 = font.render(f"A new version is available: {remote_version}", True, (255, 255, 255))
-                    update_text2 = font.render(f"Current version: {local_version}", True, (255, 255, 255))
-                    update_text3 = font.render("Would you like to update now?", True, (255, 255, 255))
+                    # Draw update notification
+                    text = [
+                        f"New version available: {remote_version}",
+                        f"Current version: {local_version}",
+                        "",
+                        "Do you want to update now?",
+                        "",
+                        "Press Y to update, N to skip"
+                    ]
                     
-                    yes_button = pygame.Rect(150, 150, 100, 40)
-                    no_button = pygame.Rect(350, 150, 100, 40)
-                    
-                    info_screen.blit(update_text1, (50, 50))
-                    info_screen.blit(update_text2, (50, 80))
-                    info_screen.blit(update_text3, (50, 110))
-                    
-                    pygame.draw.rect(info_screen, (0, 128, 0), yes_button)
-                    pygame.draw.rect(info_screen, (128, 0, 0), no_button)
-                    
-                    yes_text = button_font.render("Yes", True, (255, 255, 255))
-                    no_text = button_font.render("No", True, (255, 255, 255))
-                    
-                    info_screen.blit(yes_text, (yes_button.x + (yes_button.width - yes_text.get_width()) // 2, 
-                                               yes_button.y + (yes_button.height - yes_text.get_height()) // 2))
-                    info_screen.blit(no_text, (no_button.x + (no_button.width - no_text.get_width()) // 2,
-                                              no_button.y + (no_button.height - no_text.get_height()) // 2))
-                    
+                    y_pos = screen.get_height() // 2 - (len(text) * 40) // 2
+                    for line in text:
+                        text_surface = font.render(line, True, (255, 255, 255))
+                        text_rect = text_surface.get_rect(center=(screen.get_width() // 2, y_pos))
+                        screen.blit(text_surface, text_rect)
+                        y_pos += 40
+                        
                     pygame.display.flip()
                     
-                    # Wait for user response
-                    waiting_for_response = True
-                    should_update = False
-                    
-                    try:
-                        while waiting_for_response:
-                            for event in pygame.event.get():
-                                if event.type == pygame.QUIT:
-                                    waiting_for_response = False
-                                elif event.type == pygame.MOUSEBUTTONDOWN:
-                                    if yes_button.collidepoint(event.pos):
-                                        should_update = True
-                                        waiting_for_response = False
-                                    elif no_button.collidepoint(event.pos):
-                                        waiting_for_response = False
-                                elif event.type == pygame.KEYDOWN:
-                                    if event.key == pygame.K_RETURN or event.key == pygame.K_y:
-                                        should_update = True
-                                        waiting_for_response = False
-                                    elif event.key == pygame.K_ESCAPE or event.key == pygame.K_n:
-                                        waiting_for_response = False
-                    except Exception as e:
-                        logging.error(f"Error handling user input for update: {e}")
-                        should_update = False
+                    # Wait for user input
+                    waiting_for_input = True
+                    while waiting_for_input:
+                        for event in pygame.event.get():
+                            if event.type == pygame.QUIT:
+                                waiting_for_input = False
+                            elif event.type == pygame.KEYDOWN:
+                                if event.key == pygame.K_y:
+                                    perform_auto_update()
+                                    return True
+                                elif event.key == pygame.K_n:
+                                    waiting_for_input = False
                         
-                    try:
-                        pygame.quit()
-                    except:
-                        pass
-                    
-                    if should_update:
-                        logging.info("User selected to update. Starting update process...")
-                        # Call perform_auto_update() and exit regardless of the return value
-                        # This ensures we don't proceed with normal startup if update is chosen
-                        perform_auto_update()
-                        
-                        # If perform_auto_update somehow returns without exiting, force exit
-                        logging.info("Forcing exit after update process")
-                        sys.exit(0)
-                        
-                        # This return should never be reached but is here for completeness
-                        return True
-                    else:
-                        logging.info("User declined update, continuing with current version")
-                        return False
-                        
-                except Exception as e:
-                    logging.error(f"Error showing update dialog: {e}")
+                        # Don't hog the CPU while waiting
+                        pygame.time.wait(50)
             else:
-                logging.info("You have the latest version.")
+                # If pygame not initialized, use tkinter
+                root = tk.Tk()
+                root.title("Multi-Max Update Available")
+                root.geometry("400x300")
+                root.configure(bg='#2e2e2e')
+                
+                frame = tk.Frame(root, bg='#2e2e2e')
+                frame.pack(expand=True, fill='both', padx=20, pady=20)
+                
+                title_label = tk.Label(frame, 
+                                    text=f"New version available!",
+                                    fg='white', bg='#2e2e2e', font=("Arial", 14, "bold"))
+                title_label.pack(pady=10)
+                
+                version_label = tk.Label(frame, 
+                                     text=f"Current version: {local_version}\nNew version: {remote_version}",
+                                     fg='white', bg='#2e2e2e', font=("Arial", 12))
+                version_label.pack(pady=10)
+                
+                question_label = tk.Label(frame, 
+                                      text="Do you want to update now?",
+                                      fg='white', bg='#2e2e2e', font=("Arial", 12))
+                question_label.pack(pady=10)
+                
+                button_frame = tk.Frame(frame, bg='#2e2e2e')
+                button_frame.pack(pady=20)
+                
+                update_result = [False]  # Use a list to store result (to be modified by callbacks)
+                
+                def on_yes():
+                    update_result[0] = True
+                    root.destroy()
+                    
+                def on_no():
+                    root.destroy()
+                
+                yes_button = tk.Button(button_frame, text="Yes", command=on_yes, width=10, 
+                                     font=("Arial", 12), bg="#4CAF50", fg="white")
+                yes_button.pack(side=tk.LEFT, padx=10)
+                
+                no_button = tk.Button(button_frame, text="No", command=on_no, width=10,
+                                   font=("Arial", 12), bg="#f44336", fg="white")
+                no_button.pack(side=tk.LEFT, padx=10)
+                
+                # Center the window
+                root.update_idletasks()
+                width = root.winfo_width()
+                height = root.winfo_height()
+                x = (root.winfo_screenwidth() // 2) - (width // 2)
+                y = (root.winfo_screenheight() // 2) - (height // 2)
+                root.geometry('{}x{}+{}+{}'.format(width, height, x, y))
+                
+                root.mainloop()
+                
+                if update_result[0]:
+                    perform_auto_update()
+                    return True
+            
+            return False
         else:
-            logging.warning("Could not check for updates. Will continue with current version.")
+            logging.info(f"No update needed: local={local_version}, remote={remote_version}")
+            return False
     except Exception as e:
-        logging.error(f"Error in update check process: {e}")
-        logging.error(traceback.format_exc())
-    
-    return False
+        logging.error(f"Error checking for updates: {e}")
+        logging.exception("Stack trace:")
+        return False
 
 # Verify running on Windows
 if platform.system() != 'Windows':
@@ -1725,16 +1672,18 @@ def ensure_version_file_exists():
                 with open(CURRENT_VERSION_FILE, 'r') as f:
                     version = f.read().strip()
                     if not version:  # Empty file
+                        default_version = "1.0.1"  # Default for new installations
                         with open(CURRENT_VERSION_FILE, 'w') as fw:
-                            fw.write(CURRENT_VERSION)
-                        logging.info(f"Updated empty version file with current version: {CURRENT_VERSION}")
+                            fw.write(default_version)
+                        logging.info(f"Updated empty version file with version: {default_version}")
             except Exception as read_err:
                 logging.warning(f"Error reading version file: {read_err}")
                 # Attempt to rewrite it
                 try:
+                    default_version = "1.0.1"  # Default for new installations
                     with open(CURRENT_VERSION_FILE, 'w') as f:
-                        f.write(CURRENT_VERSION)
-                    logging.info(f"Rewritten version file with current version: {CURRENT_VERSION}")
+                        f.write(default_version)
+                    logging.info(f"Rewritten version file with version: {default_version}")
                 except Exception as write_err:
                     logging.error(f"Failed to rewrite version file: {write_err}")
                     
@@ -1748,7 +1697,7 @@ def ensure_version_file_exists():
                 with open(PARENT_VERSION_FILE, 'r') as f:
                     version = f.read().strip()
                     if not version:  # Empty file
-                        version = CURRENT_VERSION
+                        version = "1.0.1"  # Default for new installations
                 with open(CURRENT_VERSION_FILE, 'w') as f:
                     f.write(version)
                 logging.info(f"Copied version from parent directory to windows directory: {version}")
@@ -1756,19 +1705,21 @@ def ensure_version_file_exists():
             except Exception as e:
                 logging.warning(f"Failed to copy version file from parent: {e}")
                 
-        # No version file found, create one with the current version
+        # No version file found, create one with the default version
         try:
+            default_version = "1.0.1"  # Default for new installations
             with open(CURRENT_VERSION_FILE, 'w') as f:
-                f.write(CURRENT_VERSION)
-            logging.info(f"Created new version file with version {CURRENT_VERSION}")
+                f.write(default_version)
+            logging.info(f"Created new version file with version {default_version}")
             
             # Also create the parent version file for consistency
             try:
                 # Ensure parent directory exists
-                os.makedirs(os.path.dirname(PARENT_VERSION_FILE), exist_ok=True)
+                parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                os.makedirs(parent_dir, exist_ok=True)
                 with open(PARENT_VERSION_FILE, 'w') as f:
-                    f.write(CURRENT_VERSION)
-                logging.info(f"Created parent version file with version {CURRENT_VERSION}")
+                    f.write(default_version)
+                logging.info(f"Created parent version file with version {default_version}")
             except Exception as parent_err:
                 logging.warning(f"Failed to create parent version file: {parent_err}")
                 
