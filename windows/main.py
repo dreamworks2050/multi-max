@@ -541,6 +541,17 @@ def calculate_display_rect(screen_width, screen_height, aspect_ratio=None):
         y_offset = (screen_height - display_height) // 2
         return (0, y_offset, display_width, display_height)
 
+def get_optimal_fullscreen_dimensions():
+    """
+    Get the optimal fullscreen dimensions for the current display.
+    This queries the actual hardware display size rather than relying on window dimensions.
+    """
+    display_info = pygame.display.Info()
+    # Get the true display size
+    true_width, true_height = display_info.current_w, display_info.current_h
+    logging.info(f"Detected display dimensions: {true_width}x{true_height}")
+    return true_width, true_height
+
 def handle_keyboard_event(key_name, mod=None):
     """Handle keyboard inputs for adjusting settings."""
     global grid_size, depth, debug_mode, show_info, info_hidden_time, mode, fractal_grid_size, fractal_debug
@@ -554,18 +565,26 @@ def handle_keyboard_event(key_name, mod=None):
     try:
         is_repeat = key_name in ['up', 'down'] and key_pressed.get(key_name, False) and time.time() - key_press_start.get(key_name, 0) > key_repeat_delay
         
-        if key_name == 'w':
-            is_fullscreen = not is_fullscreen
+        if key_name == 'w' or key_name == 'escape':
+            # For 'escape', only handle toggle if already in fullscreen mode
+            if key_name == 'escape' and not is_fullscreen:
+                return  # Let the main event loop handle escape key when not in fullscreen
+                
+            # Toggle fullscreen state
+            is_fullscreen = not is_fullscreen if key_name == 'w' else False
+            
             if is_fullscreen:
                 # Store current window position and size before switching
                 window_size = screen.get_size()
                 
-                # Switch to fullscreen
-                screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                # Get the true screen dimensions from the hardware
+                true_width, true_height = get_optimal_fullscreen_dimensions()
+                
+                # Switch to fullscreen using the detected resolution
+                screen = pygame.display.set_mode((true_width, true_height), pygame.FULLSCREEN)
                 
                 # Precalculate display rectangle for aspect ratio preservation
-                display_info = pygame.display.Info()
-                frame_display_rect = calculate_display_rect(display_info.current_w, display_info.current_h)
+                frame_display_rect = calculate_display_rect(true_width, true_height)
                 
                 logging.info(f"Full screen mode enabled with display area: {frame_display_rect}")
             else:
@@ -1229,9 +1248,15 @@ def main():
                     running = False
                     break
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    logging.info("Escape key pressed, initiating shutdown...")
-                    running = False
-                    break
+                    if is_fullscreen:
+                        # If in fullscreen mode, ESC toggles back to windowed mode
+                        logging.info("Escape key pressed, toggling back to windowed mode...")
+                        handle_keyboard_event('escape')
+                    else:
+                        # Only exit if not in fullscreen mode
+                        logging.info("Escape key pressed, initiating shutdown...")
+                        running = False
+                        break
                 elif event.type == pygame.KEYDOWN:
                     key = pygame.key.name(event.key)
                     mod = event.mod
@@ -1402,16 +1427,16 @@ def main():
                     if mode == "grid":
                         texts.append("Press s to show/hide this info, d to debug, up/down to change grid size")
                         texts.append("Press 1-0 to set recursion depth (1-10)")
-                        texts.append("Press W to toggle full screen mode")
+                        texts.append("Press W to toggle full screen mode, ESC to exit fullscreen")
                     elif mode == "fractal":
                         texts.append("Press s to show/hide this info, d to debug, up/down grid size, f to switch modes")
                         texts.append("Press 1-3 to change source position: 1=top-left, 2=center (odd grids + 2x2 special case), 3=top-right")
                         texts.append("Press 4 to switch to fractal depth mode")
-                        texts.append("Press W to toggle full screen mode")
+                        texts.append("Press W to toggle full screen mode, ESC to exit fullscreen")
                     elif mode == "fractal_depth":
                         texts.append("Press s to show/hide this info, d to debug, f to switch modes")
                         texts.append("Press UP/DOWN arrow keys to increase/decrease depth level (1-100)")
-                        texts.append("Press W to toggle full screen mode")
+                        texts.append("Press W to toggle full screen mode, ESC to exit fullscreen")
                     line_height = 25
                     padding = 20
                     required_height = len(texts) * line_height + padding * 2
