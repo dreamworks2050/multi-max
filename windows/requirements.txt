@@ -6,6 +6,7 @@ numpy>=1.22.0           # Efficient array operations
 pygame>=2.1.0           # Display and user interface
 python-dotenv>=0.20.0   # Environment variable management
 psutil>=5.9.0           # Process and system monitoring
+requests>=2.28.0        # HTTP requests for version checking and updates
 
 # Performance analysis tools
 memory-profiler>=0.60.0 # Memory usage analysis
