@@ -239,10 +239,22 @@ def perform_auto_update():
                 pass
                 
             # Close pygame properly before launching the updater
-            pygame.quit()
+            try:
+                pygame.quit()
+            except:
+                pass
         except Exception as e:
             logging.error(f"Error showing update notification: {e}")
             # Continue with update even if notification fails
+        
+        # Try to clean up any running processes or threads
+        try:
+            # Stop any running threads
+            if 'frame_reader_thread' in globals() and globals()['frame_reader_thread'] is not None:
+                globals()['should_stop_frame_reader'] = True
+                # Don't wait for join - just signal it to stop
+        except Exception as cleanup_err:
+            logging.error(f"Error during pre-update cleanup: {cleanup_err}")
         
         # Import the update module from the windows directory
         try:
@@ -257,32 +269,46 @@ def perform_auto_update():
                 import update
             except ImportError:
                 logging.error("Failed to import update module")
-                return False
+                # Even if we fail to import, we should exit since user chose to update
+                logging.info("Forcing exit due to update request")
+                sys.exit(0)
+        
+        # Create a marker file to indicate update was initiated
+        windows_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            with open(os.path.join(windows_dir, "update_requested.txt"), 'w') as f:
+                f.write(f"Update requested at: {time.ctime()}\n")
+                f.write(f"From version: {get_local_version()}\n")
+        except Exception as marker_err:
+            logging.warning(f"Could not write update marker file: {marker_err}")
         
         # Start the update process using the update module
-        if update.start_update_process():
-            logging.info("Update process initiated successfully. Exiting current instance.")
+        update_started = False
+        try:
+            update_started = update.start_update_process()
+            if update_started:
+                logging.info("Update process initiated successfully. Exiting current instance.")
+            else:
+                logging.error("Failed to start update process - will exit anyway")
+        except Exception as update_err:
+            logging.error(f"Exception during update process: {update_err}")
             
-            # Sleep briefly to allow the update process to start
-            time.sleep(1)
-            
-            # Exit cleanly
-            try:
-                pygame.quit()
-            except:
-                pass
-                
-            # Exit with success code
-            sys.exit(0)
-            return True
-        else:
-            logging.error("Failed to start update process")
-            return False
-            
+        # Always exit regardless of whether update started successfully
+        # This ensures we don't proceed with normal startup
+        logging.info("Exiting application for update")
+        
+        # Sleep briefly to allow the update process to start and logs to be written
+        time.sleep(1)
+        
+        # Force exit with success code
+        sys.exit(0)
     except Exception as e:
         logging.error(f"Failed to perform automatic update: {e}")
         logging.error(traceback.format_exc())
-        return False
+        
+        # Still exit even if there was an error to avoid starting the application
+        logging.info("Exiting due to update request despite errors")
+        sys.exit(1)
 
 def check_for_updates():
     """Check if an update is available and trigger the update process if needed."""
@@ -395,7 +421,21 @@ def check_for_updates():
                         pass
                     
                     if should_update:
-                        return perform_auto_update()
+                        logging.info("User selected to update. Starting update process...")
+                        # Call perform_auto_update() and exit regardless of the return value
+                        # This ensures we don't proceed with normal startup if update is chosen
+                        perform_auto_update()
+                        
+                        # If perform_auto_update somehow returns without exiting, force exit
+                        logging.info("Forcing exit after update process")
+                        sys.exit(0)
+                        
+                        # This return should never be reached but is here for completeness
+                        return True
+                    else:
+                        logging.info("User declined update, continuing with current version")
+                        return False
+                        
                 except Exception as e:
                     logging.error(f"Error showing update dialog: {e}")
             else:
@@ -1698,14 +1738,51 @@ def main():
     last_fractal_cleanup_time = time.time()
     fractal_cleanup_interval = 10.0
     
+    # First thing: check for updates before initializing any GUI
     try:
         # Ensure we have a valid version file for update checks
         ensure_version_file_exists()
         
-        # Initialize pygame with simplified error handling for Windows compatibility
+        # Initialize minimal pygame for update check
         try:
             pygame.init()
-            logging.info("Pygame initialized successfully")
+            logging.info("Pygame initialized for update check")
+        except Exception as e:
+            logging.error(f"Error initializing pygame for update check: {e}")
+            # Try basic display init
+            try:
+                pygame.display.init()
+                pygame.font.init()
+            except Exception as e2:
+                logging.error(f"Failed to initialize pygame components: {e2}")
+                # Continue anyway - the update code has error handling
+        
+        # Check for updates before doing any other initialization
+        logging.info("Checking for updates before starting the application...")
+        update_result = check_for_updates()
+        
+        # If update_result is True, the update process has started
+        # This should never happen as the update functions should have called sys.exit()
+        # But just in case they didn't, exit explicitly here
+        if update_result:
+            logging.info("Update process initiated, exiting main function")
+            try:
+                pygame.quit()
+            except:
+                pass
+            return
+        
+        logging.info("No update needed or user declined update. Continuing with application startup.")
+    except Exception as e:
+        logging.error(f"Error during pre-startup update check: {e}")
+        # Continue with startup if update check fails
+    
+    # Only continue with full initialization if no update is happening
+    try:
+        # Re-initialize pygame for main application
+        try:
+            pygame.init()
+            logging.info("Pygame initialized successfully for main application")
         except Exception as e:
             logging.error(f"Error initializing pygame: {e}")
             # Try individual components that we absolutely need
@@ -1729,16 +1806,6 @@ def main():
         except:
             pass
             
-        # Check for updates before proceeding
-        if check_for_updates():
-            # If update process was triggered, the function won't return
-            # But just in case it does return True, we should exit
-            try:
-                pygame.quit()
-            except:
-                pass
-            return
-        
         # Continue with normal initialization
         pygame.display.set_caption("MultiMax Grid")
         
