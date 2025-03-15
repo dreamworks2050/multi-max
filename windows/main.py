@@ -24,31 +24,47 @@ import re
 # Windows-specific version marker - DO NOT REMOVE - used by installer to verify correct version
 __windows_specific_version__ = True
 
-# Setup version checking mechanism
+# Setup version checking mechanism with corrected paths
 CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
+# Also check the parent directory for version.txt (where the installer might have placed it)
+PARENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "version.txt")
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/dreamworks2050/multi-max/main/windows/version.txt"
 VERSION_CHECK_TIMEOUT = 5  # seconds
 
 def get_local_version():
     """Read the local version number from version.txt file."""
     try:
+        # First try the version file in the windows directory
         if os.path.exists(CURRENT_VERSION_FILE):
             with open(CURRENT_VERSION_FILE, 'r') as f:
                 version = f.read().strip()
+                logging.info(f"Found local version in windows directory: {version}")
                 return version
-        else:
-            logging.warning(f"Local version file not found at {CURRENT_VERSION_FILE}")
-            return "0.0.0"  # Default version if file doesn't exist
+        
+        # If not found, try the parent directory
+        if os.path.exists(PARENT_VERSION_FILE):
+            with open(PARENT_VERSION_FILE, 'r') as f:
+                version = f.read().strip()
+                logging.info(f"Found local version in parent directory: {version}")
+                return version
+                
+        # If neither exists, log both paths we tried
+        logging.warning(f"Local version file not found at {CURRENT_VERSION_FILE}")
+        logging.warning(f"Also checked {PARENT_VERSION_FILE}")
+        return "0.0.0"  # Default version if file doesn't exist
     except Exception as e:
         logging.error(f"Error reading local version: {e}")
         return "0.0.0"
-        
+
 def get_remote_version():
     """Fetch the latest version number from the repository."""
     try:
+        logging.info(f"Checking for updates from: {REMOTE_VERSION_URL}")
         response = requests.get(REMOTE_VERSION_URL, timeout=VERSION_CHECK_TIMEOUT)
         if response.status_code == 200:
-            return response.text.strip()
+            remote_version = response.text.strip()
+            logging.info(f"Retrieved remote version: {remote_version}")
+            return remote_version
         else:
             logging.warning(f"Failed to fetch remote version. Status code: {response.status_code}")
             return None
@@ -129,29 +145,39 @@ def versions_need_update(local_version, remote_version):
 def perform_auto_update():
     """Trigger the automatic update process."""
     try:
+        # Find the installer - check multiple possible locations
         windows_dir = os.path.dirname(os.path.abspath(__file__))
-        installer_path = os.path.join(windows_dir, "Install-Windows.bat")
+        parent_dir = os.path.dirname(windows_dir)
         
-        if not os.path.exists(installer_path):
-            logging.error(f"Installer not found at {installer_path}")
-            # Try to find the installer using an absolute path search
-            alternate_paths = [
-                os.path.join(os.path.dirname(windows_dir), "Install-Windows.bat"),
-                os.path.join(os.path.dirname(windows_dir), "windows", "Install-Windows.bat"),
-                os.path.join(os.path.dirname(os.path.dirname(windows_dir)), "Install-Windows.bat"),
-                os.path.join(os.path.dirname(os.path.dirname(windows_dir)), "windows", "Install-Windows.bat")
-            ]
-            
-            for alt_path in alternate_paths:
-                if os.path.exists(alt_path):
-                    logging.info(f"Found installer at alternative location: {alt_path}")
-                    installer_path = alt_path
-                    break
-                    
-            if not os.path.exists(installer_path):
-                logging.error("Could not find the installer at any expected location")
-                # Just return without trying to update
-                return False
+        # Possible locations for the installer
+        installer_locations = [
+            # In the windows directory
+            os.path.join(windows_dir, "Install-Windows.bat"),
+            # In the parent directory 
+            os.path.join(parent_dir, "Install-Windows.bat"),
+            # In the parent directory as a different name
+            os.path.join(parent_dir, "install.bat"),
+            # In a windows subfolder of parent
+            os.path.join(parent_dir, "windows", "Install-Windows.bat")
+        ]
+        
+        # Log all potential paths for debugging
+        logging.info("Searching for installer in the following locations:")
+        for loc in installer_locations:
+            logging.info(f"- {loc} {'(FOUND)' if os.path.exists(loc) else '(NOT FOUND)'}")
+        
+        # Find the first valid installer path
+        installer_path = None
+        for path in installer_locations:
+            if os.path.exists(path):
+                installer_path = path
+                logging.info(f"Found installer at: {installer_path}")
+                break
+                
+        if not installer_path:
+            logging.error("Could not find the installer at any expected location")
+            # Just return without trying to update
+            return False
             
         logging.info(f"Starting automatic update process with installer: {installer_path}")
         
@@ -191,7 +217,8 @@ def perform_auto_update():
                 lines = [
                     "A new version of Multi-Max is available!",
                     "The application will now update automatically.",
-                    "Please wait while the installer runs..."
+                    "Please wait while the installer runs...",
+                    f"Installer: {os.path.basename(installer_path)}"
                 ]
                 
                 y_position = 50
@@ -225,19 +252,31 @@ def perform_auto_update():
             # Use a more robust Windows-specific approach
             if platform.system() == 'Windows':
                 try:
-                    # First try with the standard approach
-                    creation_flags = 0x00000010  # CREATE_NEW_CONSOLE flag
-                    subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], 
-                                   creationflags=creation_flags)
-                except:
-                    # Fall back to simpler approach if the first one fails
-                    subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], shell=True)
+                    # First try with the cleaner approach
+                    subprocess.Popen([installer_path], shell=True)
+                except Exception as e1:
+                    logging.warning(f"First installer launch attempt failed: {e1}")
+                    try:
+                        # Second approach with cmd
+                        subprocess.Popen(['cmd.exe', '/c', 'start', installer_path], shell=True)
+                    except Exception as e2:
+                        logging.warning(f"Second installer launch attempt failed: {e2}")
+                        # Final fallback with direct cmd string
+                        cmd = f'cmd.exe /c start "" "{installer_path}"'
+                        subprocess.Popen(cmd, shell=True)
             else:
                 # This should never happen on Windows version
                 subprocess.Popen([installer_path], shell=True)
             
             logging.info("Update initiated. Exiting current instance.")
             time.sleep(1)  # Give the subprocess a moment to start
+            
+            # Write a marker file to indicate we've attempted an update
+            try:
+                with open(os.path.join(windows_dir, "update_attempted.txt"), 'w') as f:
+                    f.write(f"Update attempted at {time.ctime()}\nFrom version: {get_local_version()}\nInstaller: {installer_path}")
+            except Exception as marker_error:
+                logging.warning(f"Could not write update marker file: {marker_error}")
             
             # Exit cleanly
             try:
@@ -294,6 +333,14 @@ def check_for_updates():
         
         if remote_version:
             logging.info(f"Latest available version: {remote_version}")
+            
+            # Write the detected remote version to disk for debugging purposes
+            try:
+                debug_version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_detected_version.txt")
+                with open(debug_version_file, 'w') as f:
+                    f.write(f"Local: {local_version}\nRemote: {remote_version}\nTimestamp: {time.ctime()}")
+            except Exception as e:
+                logging.warning(f"Could not write debug version file: {e}")
             
             if versions_need_update(local_version, remote_version):
                 logging.info(f"New version available: {remote_version} (current: {local_version})")
@@ -1565,6 +1612,41 @@ def shutdown_application():
     
     logging.info("Shutdown complete. Goodbye!")
 
+def ensure_version_file_exists():
+    """Ensure that a version.txt file exists, creating it if necessary.
+    This helps with future update checks."""
+    try:
+        # Check if version file exists in the windows directory
+        if os.path.exists(CURRENT_VERSION_FILE):
+            logging.info(f"Version file exists at {CURRENT_VERSION_FILE}")
+            return True
+            
+        # Check if version file exists in parent directory
+        if os.path.exists(PARENT_VERSION_FILE):
+            # Copy the parent version file to the windows directory for consistency
+            try:
+                with open(PARENT_VERSION_FILE, 'r') as f:
+                    version = f.read().strip()
+                with open(CURRENT_VERSION_FILE, 'w') as f:
+                    f.write(version)
+                logging.info(f"Copied version from parent directory to windows directory: {version}")
+                return True
+            except Exception as e:
+                logging.warning(f"Failed to copy version file from parent: {e}")
+                
+        # No version file found, create one with the default version
+        try:
+            with open(CURRENT_VERSION_FILE, 'w') as f:
+                f.write("1.0.0")  # Default version
+            logging.info("Created new version file with default version 1.0.0")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to create version file: {e}")
+            return False
+    except Exception as e:
+        logging.error(f"Error in ensure_version_file_exists: {e}")
+        return False
+
 def main():
     """Main function for Windows-compatible video processing."""
     global running, grid_size, depth, debug_mode, show_info, frame_count, processed_count, displayed_count, dropped_count
@@ -1592,6 +1674,9 @@ def main():
     fractal_cleanup_interval = 10.0
     
     try:
+        # Ensure we have a valid version file for update checks
+        ensure_version_file_exists()
+        
         # Initialize pygame with simplified error handling for Windows compatibility
         try:
             pygame.init()
