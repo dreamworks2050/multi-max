@@ -24,6 +24,9 @@ import re
 # Windows-specific version marker - DO NOT REMOVE - used by installer to verify correct version
 __windows_specific_version__ = True
 
+# Current version - centralized in one place
+CURRENT_VERSION = "1.0.1"  # Update this value when releasing a new version
+
 # Setup version checking mechanism with corrected paths
 CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
 # Also check the parent directory for version.txt (where the installer might have placed it)
@@ -32,12 +35,18 @@ REMOTE_VERSION_URL = "https://raw.githubusercontent.com/dreamworks2050/multi-max
 VERSION_CHECK_TIMEOUT = 5  # seconds
 
 def get_local_version():
-    """Read the local version number from version.txt file."""
+    """Read the local version number from version.txt file, creating it if it doesn't exist."""
     try:
         # First try the version file in the windows directory
         if os.path.exists(CURRENT_VERSION_FILE):
             with open(CURRENT_VERSION_FILE, 'r') as f:
                 version = f.read().strip()
+                # If the file exists but is empty or has an invalid format, write the current version
+                if not version:
+                    with open(CURRENT_VERSION_FILE, 'w') as fw:
+                        fw.write(CURRENT_VERSION)
+                    version = CURRENT_VERSION
+                    logging.info(f"Wrote current version to empty file: {version}")
                 logging.info(f"Found local version in windows directory: {version}")
                 return version
         
@@ -45,16 +54,40 @@ def get_local_version():
         if os.path.exists(PARENT_VERSION_FILE):
             with open(PARENT_VERSION_FILE, 'r') as f:
                 version = f.read().strip()
+                # If parent file exists but windows file doesn't, write the version to windows file too
+                if not os.path.exists(CURRENT_VERSION_FILE):
+                    try:
+                        with open(CURRENT_VERSION_FILE, 'w') as fw:
+                            fw.write(version)
+                        logging.info(f"Copied version from parent directory to windows directory: {version}")
+                    except Exception as write_err:
+                        logging.warning(f"Could not write version to windows directory: {write_err}")
                 logging.info(f"Found local version in parent directory: {version}")
                 return version
                 
-        # If neither exists, log both paths we tried
+        # If neither exists, create the file with the current version
         logging.warning(f"Local version file not found at {CURRENT_VERSION_FILE}")
         logging.warning(f"Also checked {PARENT_VERSION_FILE}")
-        return "0.0.0"  # Default version if file doesn't exist
+        logging.info(f"Creating version file with current version: {CURRENT_VERSION}")
+        
+        try:
+            # Create the windows version file
+            with open(CURRENT_VERSION_FILE, 'w') as f:
+                f.write(CURRENT_VERSION)
+            
+            # Also create parent version file for consistency
+            os.makedirs(os.path.dirname(PARENT_VERSION_FILE), exist_ok=True)
+            with open(PARENT_VERSION_FILE, 'w') as f:
+                f.write(CURRENT_VERSION)
+                
+            return CURRENT_VERSION
+        except Exception as create_err:
+            logging.error(f"Error creating version file: {create_err}")
+            return CURRENT_VERSION  # Return the current version anyway
+            
     except Exception as e:
         logging.error(f"Error reading local version: {e}")
-        return "0.0.0"
+        return CURRENT_VERSION  # Return the current version as fallback
 
 def get_remote_version():
     """Fetch the latest version number from the repository."""
@@ -1579,6 +1612,24 @@ def ensure_version_file_exists():
     try:
         # Check if version file exists in the windows directory
         if os.path.exists(CURRENT_VERSION_FILE):
+            # Verify it has valid content
+            try:
+                with open(CURRENT_VERSION_FILE, 'r') as f:
+                    version = f.read().strip()
+                    if not version:  # Empty file
+                        with open(CURRENT_VERSION_FILE, 'w') as fw:
+                            fw.write(CURRENT_VERSION)
+                        logging.info(f"Updated empty version file with current version: {CURRENT_VERSION}")
+            except Exception as read_err:
+                logging.warning(f"Error reading version file: {read_err}")
+                # Attempt to rewrite it
+                try:
+                    with open(CURRENT_VERSION_FILE, 'w') as f:
+                        f.write(CURRENT_VERSION)
+                    logging.info(f"Rewritten version file with current version: {CURRENT_VERSION}")
+                except Exception as write_err:
+                    logging.error(f"Failed to rewrite version file: {write_err}")
+                    
             logging.info(f"Version file exists at {CURRENT_VERSION_FILE}")
             return True
             
@@ -1588,6 +1639,8 @@ def ensure_version_file_exists():
             try:
                 with open(PARENT_VERSION_FILE, 'r') as f:
                     version = f.read().strip()
+                    if not version:  # Empty file
+                        version = CURRENT_VERSION
                 with open(CURRENT_VERSION_FILE, 'w') as f:
                     f.write(version)
                 logging.info(f"Copied version from parent directory to windows directory: {version}")
@@ -1595,11 +1648,22 @@ def ensure_version_file_exists():
             except Exception as e:
                 logging.warning(f"Failed to copy version file from parent: {e}")
                 
-        # No version file found, create one with the default version
+        # No version file found, create one with the current version
         try:
             with open(CURRENT_VERSION_FILE, 'w') as f:
-                f.write("1.0.0")  # Default version
-            logging.info("Created new version file with default version 1.0.0")
+                f.write(CURRENT_VERSION)
+            logging.info(f"Created new version file with version {CURRENT_VERSION}")
+            
+            # Also create the parent version file for consistency
+            try:
+                # Ensure parent directory exists
+                os.makedirs(os.path.dirname(PARENT_VERSION_FILE), exist_ok=True)
+                with open(PARENT_VERSION_FILE, 'w') as f:
+                    f.write(CURRENT_VERSION)
+                logging.info(f"Created parent version file with version {CURRENT_VERSION}")
+            except Exception as parent_err:
+                logging.warning(f"Failed to create parent version file: {parent_err}")
+                
             return True
         except Exception as e:
             logging.error(f"Failed to create version file: {e}")

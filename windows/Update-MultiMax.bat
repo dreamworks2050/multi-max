@@ -85,9 +85,21 @@ timeout /t 2 >nul
 set "TEMP_DIR=%TEMP%\multi-max-update-%BACKUP_TIME%"
 mkdir "%TEMP_DIR%" 2>nul
 
-:: Clone the repository to the temporary directory
-echo Downloading latest version from GitHub...
-git clone https://github.com/dreamworks2050/multi-max.git "%TEMP_DIR%" >nul 2>&1
+:: Download only the windows folder from the repository
+echo Downloading latest Windows version from GitHub...
+mkdir "%TEMP_DIR%" 2>nul
+cd "%TEMP_DIR%"
+
+:: Initialize a git repository
+git init >nul 2>&1
+git remote add origin https://github.com/dreamworks2050/multi-max.git >nul 2>&1
+
+:: Set up sparse checkout to only get the windows folder
+git config core.sparseCheckout true >nul 2>&1
+echo windows/ > .git/info/sparse-checkout
+
+:: Pull only the main branch with depth 1 to minimize download size
+git pull --depth=1 origin main >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: Failed to download the latest version from GitHub.
     echo Please check your internet connection and try again.
@@ -95,10 +107,12 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+echo Successfully downloaded the Windows-specific files.
+
 :: Preserve all user data from windows directory before replacing
-if exist "%ROOT_DIR%\windows\version.txt" (
-    copy /Y "%ROOT_DIR%\windows\version.txt" "%BACKUP_DIR%\version.txt" >nul
-    echo Backed up version information
+if exist "%ROOT_DIR%\.env" (
+    copy /Y "%ROOT_DIR%\.env" "%BACKUP_DIR%\.env" >nul
+    echo Backed up .env configuration
 )
 
 :: Remove all files from the current installation except .git and backups
@@ -121,7 +135,26 @@ for %%F in ("%ROOT_DIR%\*") do (
 
 :: Copy all files from the temporary clone to the installation directory
 echo Installing new version...
-xcopy /E /I /H /Y "%TEMP_DIR%\*" "%ROOT_DIR%\" >nul
+if exist "%TEMP_DIR%\windows" (
+    :: Create windows directory if it doesn't exist
+    if not exist "%ROOT_DIR%\windows" mkdir "%ROOT_DIR%\windows"
+    
+    :: Copy all windows folder contents
+    xcopy /E /I /H /Y "%TEMP_DIR%\windows\*" "%ROOT_DIR%\windows\" >nul
+    
+    :: Copy the Windows main.py to the root directory
+    if exist "%TEMP_DIR%\windows\main.py" (
+        copy /Y "%TEMP_DIR%\windows\main.py" "%ROOT_DIR%\main.py" >nul
+        echo Installed Windows-specific main.py
+    )
+    
+    echo Installed Windows-specific files
+) else (
+    echo ERROR: Windows folder not found in downloaded files.
+    echo Please check the repository structure.
+    pause
+    exit /b 1
+)
 
 :: Restore user configuration
 if exist "%BACKUP_DIR%\.env" (
@@ -129,19 +162,18 @@ if exist "%BACKUP_DIR%\.env" (
     echo Restored user configuration
 )
 
-:: Ensure the windows folder exists
-if not exist "%ROOT_DIR%\windows" mkdir "%ROOT_DIR%\windows"
-
-:: Copy the Windows-specific files to the main directory
-if exist "%ROOT_DIR%\windows\main.py" (
-    copy /Y "%ROOT_DIR%\windows\main.py" "%ROOT_DIR%\main.py" >nul
-    echo Installed Windows-specific version
-)
-
-:: Ensure the version file is updated
+:: Ensure the version file exists and is consistent
+echo Setting up version information...
 if exist "%TEMP_DIR%\windows\version.txt" (
+    :: Copy version to windows directory
     copy /Y "%TEMP_DIR%\windows\version.txt" "%ROOT_DIR%\windows\version.txt" >nul
-    echo Updated version information
+    :: Also copy to root for backwards compatibility
+    copy /Y "%TEMP_DIR%\windows\version.txt" "%ROOT_DIR%\version.txt" >nul
+    
+    :: Read and display version
+    for /f "tokens=*" %%a in ('type "%TEMP_DIR%\windows\version.txt"') do (
+        echo Installed version: %%a
+    )
 )
 
 :: Run the Windows installer to update dependencies
