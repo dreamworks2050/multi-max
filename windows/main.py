@@ -31,7 +31,6 @@ CURRENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 PARENT_VERSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "version.txt")
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/dreamworks2050/multi-max/main/windows/version.txt"
 VERSION_CHECK_TIMEOUT = 5  # seconds
-DEFAULT_VERSION = "1.0.1"  # Default version for new installations
 
 def get_local_version():
     """Read the local version number from version.txt file, creating it if it doesn't exist."""
@@ -57,27 +56,32 @@ def get_local_version():
                     try:
                         with open(CURRENT_VERSION_FILE, 'w') as f:
                             f.write(version)
-                        logging.info(f"Copied version '{version}' to windows directory")
+                        logging.info(f"Copied version from parent directory to windows directory: {version}")
                     except Exception as e:
                         logging.warning(f"Could not copy version to windows directory: {e}")
                     return version
         except Exception as e:
             logging.warning(f"Error reading version file from parent directory: {e}")
     
-    # If we couldn't read from either location or they were empty, create the file with default version
-    logging.warning("Version file not found or empty, creating with default version")
+    # If we couldn't read from either location or they were empty, try to get remote version
     try:
-        # Ensure the windows directory exists
-        windows_dir = os.path.dirname(os.path.abspath(__file__))
-        os.makedirs(windows_dir, exist_ok=True)
-        
-        with open(CURRENT_VERSION_FILE, 'w') as f:
-            f.write(DEFAULT_VERSION)
-        logging.info(f"Created version file with default version: {DEFAULT_VERSION}")
-        return DEFAULT_VERSION
+        logging.warning("Version file not found or empty, attempting to get current version from remote")
+        remote_version = get_remote_version()
+        if remote_version:
+            # Ensure the windows directory exists
+            windows_dir = os.path.dirname(os.path.abspath(__file__))
+            os.makedirs(windows_dir, exist_ok=True)
+            
+            with open(CURRENT_VERSION_FILE, 'w') as f:
+                f.write(remote_version)
+            logging.info(f"Created version file with remote version: {remote_version}")
+            return remote_version
     except Exception as e:
-        logging.error(f"Could not create version file: {e}")
-        return DEFAULT_VERSION
+        logging.error(f"Could not get remote version: {e}")
+    
+    # Last resort - return a placeholder version
+    logging.error("Could not determine version from any source, using placeholder")
+    return "unknown"
 
 def get_remote_version():
     """Check GitHub for the latest version number."""
@@ -1672,18 +1676,26 @@ def ensure_version_file_exists():
                 with open(CURRENT_VERSION_FILE, 'r') as f:
                     version = f.read().strip()
                     if not version:  # Empty file
-                        default_version = "1.0.1"  # Default for new installations
-                        with open(CURRENT_VERSION_FILE, 'w') as fw:
-                            fw.write(default_version)
-                        logging.info(f"Updated empty version file with version: {default_version}")
+                        # Try to get the remote version
+                        try:
+                            remote_version = get_remote_version()
+                            if remote_version:
+                                with open(CURRENT_VERSION_FILE, 'w') as fw:
+                                    fw.write(remote_version)
+                                logging.info(f"Updated empty version file with remote version: {remote_version}")
+                            else:
+                                logging.warning("Could not get remote version, leaving version file empty")
+                        except Exception as remote_err:
+                            logging.warning(f"Failed to get remote version: {remote_err}")
             except Exception as read_err:
                 logging.warning(f"Error reading version file: {read_err}")
-                # Attempt to rewrite it
+                # Attempt to rewrite it with remote version
                 try:
-                    default_version = "1.0.1"  # Default for new installations
-                    with open(CURRENT_VERSION_FILE, 'w') as f:
-                        f.write(default_version)
-                    logging.info(f"Rewritten version file with version: {default_version}")
+                    remote_version = get_remote_version()
+                    if remote_version:
+                        with open(CURRENT_VERSION_FILE, 'w') as f:
+                            f.write(remote_version)
+                        logging.info(f"Rewritten version file with remote version: {remote_version}")
                 except Exception as write_err:
                     logging.error(f"Failed to rewrite version file: {write_err}")
                     
@@ -1697,20 +1709,31 @@ def ensure_version_file_exists():
                 with open(PARENT_VERSION_FILE, 'r') as f:
                     version = f.read().strip()
                     if not version:  # Empty file
-                        version = "1.0.1"  # Default for new installations
+                        remote_version = get_remote_version()
+                        version = remote_version if remote_version else ""
                 with open(CURRENT_VERSION_FILE, 'w') as f:
                     f.write(version)
-                logging.info(f"Copied version from parent directory to windows directory: {version}")
+                if version:
+                    logging.info(f"Copied version from parent directory to windows directory: {version}")
+                else:
+                    logging.warning("Copied empty version from parent directory, consider updating the version file")
                 return True
             except Exception as e:
                 logging.warning(f"Failed to copy version file from parent: {e}")
                 
-        # No version file found, create one with the default version
+        # No version file found, create one with the remote version
         try:
-            default_version = "1.0.1"  # Default for new installations
+            remote_version = get_remote_version()
+            if not remote_version:
+                logging.warning("Could not get remote version, creating empty version file")
+                remote_version = ""
+                
             with open(CURRENT_VERSION_FILE, 'w') as f:
-                f.write(default_version)
-            logging.info(f"Created new version file with version {default_version}")
+                f.write(remote_version)
+            if remote_version:
+                logging.info(f"Created new version file with remote version: {remote_version}")
+            else:
+                logging.warning("Created empty version file, update checks may not work correctly")
             
             # Also create the parent version file for consistency
             try:
@@ -1718,8 +1741,9 @@ def ensure_version_file_exists():
                 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 os.makedirs(parent_dir, exist_ok=True)
                 with open(PARENT_VERSION_FILE, 'w') as f:
-                    f.write(default_version)
-                logging.info(f"Created parent version file with version {default_version}")
+                    f.write(remote_version)
+                if remote_version:
+                    logging.info(f"Created parent version file with remote version: {remote_version}")
             except Exception as parent_err:
                 logging.warning(f"Failed to create parent version file: {parent_err}")
                 
