@@ -164,6 +164,7 @@ def start_frame_reader_thread(video_source, stream_url, original_youtube_url, bu
     
     def frame_reader_worker():
         logging.info("Frame reader thread started")
+        global current_stream_url, last_url_refresh_time, stream_url_refresh_interval
         frames_read = 0
         frames_dropped = 0
         consecutive_failures = 0
